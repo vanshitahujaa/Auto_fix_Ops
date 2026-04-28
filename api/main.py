@@ -3,17 +3,27 @@ import hashlib
 import time
 from typing import Optional
 from fastapi import FastAPI, Depends, Request, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func
 from datetime import datetime, timedelta
 
 from .database import init_relational_db, get_db, incident_contexts_collection, logger
-from .models import Incident, IncidentStatus, RemediationAudit, ExecutionStatus
+from .models import Incident, IncidentStatus, RemediationAudit, ExecutionStatus, ProjectConfig
 from .schemas import AlertmanagerPayload
 from workers.tasks import build_incident_context, execute_remediation
 
 app = FastAPI(title="AutoFixOps API Gateway")
+
+# CORS — allow dashboard direct access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
@@ -292,3 +302,132 @@ async def get_metrics(db: Session = Depends(get_db)):
         "last_24h": _compute_metrics(db, since=now - timedelta(hours=24)),
         "last_7d": _compute_metrics(db, since=now - timedelta(days=7)),
     }
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT 6: System Status (top bar indicator)
+# ════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/status")
+async def get_system_status(db: Session = Depends(get_db)):
+    from engine.circuit_breaker import get_circuit_breaker
+    config = db.query(ProjectConfig).filter(ProjectConfig.id == "singleton").first()
+    breaker = get_circuit_breaker()
+    return {
+        "shadow_mode": config.shadow_mode if config else "true",
+        "circuit_breaker": breaker.state,
+        "github_connected": bool(config and config.github_token_encrypted),
+        "prometheus_url": config.prometheus_url if config else None,
+        "target_namespace": config.target_namespace if config else "autofixops",
+    }
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT 7: Project Configuration (encrypted token)
+# ════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/config")
+async def get_config(db: Session = Depends(get_db)):
+    config = db.query(ProjectConfig).filter(ProjectConfig.id == "singleton").first()
+    if not config:
+        return {"configured": False}
+    return {
+        "configured": True,
+        "github_repo": config.github_repo,
+        "github_token": config.get_masked_token(),
+        "prometheus_url": config.prometheus_url,
+        "target_namespace": config.target_namespace,
+        "target_manifest_path": config.target_manifest_path,
+        "shadow_mode": config.shadow_mode,
+        "confidence_threshold": config.confidence_threshold,
+    }
+
+
+@app.post("/api/v1/config")
+async def save_config(request: Request, db: Session = Depends(get_db)):
+    body = await request.json()
+    config = db.query(ProjectConfig).filter(ProjectConfig.id == "singleton").first()
+
+    if not config:
+        config = ProjectConfig(id="singleton")
+        db.add(config)
+
+    config.github_repo = body.get("github_repo", config.github_repo)
+    config.prometheus_url = body.get("prometheus_url", config.prometheus_url)
+    config.target_namespace = body.get("target_namespace", config.target_namespace)
+    config.target_manifest_path = body.get("target_manifest_path", config.target_manifest_path)
+    config.shadow_mode = body.get("shadow_mode", config.shadow_mode)
+    config.confidence_threshold = body.get("confidence_threshold", config.confidence_threshold)
+
+    # Token: only update if provided (never return raw)
+    if body.get("github_token"):
+        config.set_github_token(body["github_token"])
+
+    db.commit()
+    logger.info("[CONFIG] Project configuration saved.")
+    return {"status": "saved"}
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT 8: Chaos Injection (with safeguards)
+# ════════════════════════════════════════════════════════════
+
+import httpx
+
+ALLOWED_CHAOS_NAMESPACES = {"autofixops", "staging", "test", "dev", "default"}
+CHAOS_RATE_LIMIT: dict = {}  # Simple in-memory rate limiter
+
+@app.post("/api/v1/chaos/inject")
+async def inject_chaos(request: Request, db: Session = Depends(get_db)):
+    body = await request.json()
+    fault_type = body.get("fault_type")  # "memory_leak", "cpu_spike", "crash_loop"
+    target_url = body.get("target_url")  # e.g. "http://target-app:8000"
+    confirmation = body.get("confirmation")  # Must be "CONFIRM"
+
+    if confirmation != "CONFIRM":
+        raise HTTPException(status_code=400, detail="Must type CONFIRM to inject chaos.")
+
+    # Namespace check
+    config = db.query(ProjectConfig).filter(ProjectConfig.id == "singleton").first()
+    namespace = config.target_namespace if config else "autofixops"
+    if namespace not in ALLOWED_CHAOS_NAMESPACES:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Chaos injection blocked: namespace '{namespace}' is not in allowed list.",
+        )
+
+    # Rate limit: max 1 injection per 30 seconds
+    now = time.time()
+    last = CHAOS_RATE_LIMIT.get(fault_type, 0)
+    if now - last < 30:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limited. Wait {30 - int(now - last)}s before next injection.",
+        )
+    CHAOS_RATE_LIMIT[fault_type] = now
+
+    # Route to target app endpoint
+    endpoint_map = {
+        "memory_leak": "/leak",
+        "cpu_spike": "/cpu",
+        "crash_loop": "/crash",
+    }
+    endpoint = endpoint_map.get(fault_type)
+    if not endpoint:
+        raise HTTPException(status_code=400, detail=f"Unknown fault type: {fault_type}")
+
+    if not target_url:
+        raise HTTPException(status_code=400, detail="target_url is required.")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{target_url}{endpoint}")
+        logger.info(f"[CHAOS] Injected {fault_type} via {target_url}{endpoint} → {resp.status_code}")
+        return {
+            "status": "injected",
+            "fault_type": fault_type,
+            "target": f"{target_url}{endpoint}",
+            "response_code": resp.status_code,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to reach target: {str(e)}")
