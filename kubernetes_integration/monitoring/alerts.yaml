@@ -1,0 +1,39 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: autofixops-alerts
+  namespace: autofixops # Can be deployed where kube-prometheus-stack watches
+  labels:
+    app: kube-prometheus-stack
+    release: prometheus # standard label so prometheus picks it up
+spec:
+  groups:
+  - name: autofixops-alerts
+    rules:
+    - alert: HighCPUUsage
+      # Metric syntax depends on cAdvisor (container_cpu_usage_seconds_total)
+      expr: sum(rate(container_cpu_usage_seconds_total{namespace="autofixops", pod=~"autofixops-target-app-.*"}[1m])) by (pod) > 0.4
+      for: 30s
+      labels:
+        severity: warning
+      annotations:
+        summary: "High CPU usage detected on {{ $labels.pod }}"
+        description: "Pod {{ $labels.pod }} is exceeding 80% CPU usage threshold (relative to bounds) for more than 30s."
+
+    - alert: TargetAppMemoryLeak
+      expr: (container_memory_working_set_bytes{namespace="autofixops", pod=~"autofixops-target-app-.*"} / container_spec_memory_limit_bytes{namespace="autofixops", pod=~"autofixops-target-app-.*"}) > 0.90
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Memory Leak Detected on {{ $labels.pod }}"
+        description: "Pod {{ $labels.pod }} memory is over 90% and approaching OOMKill."
+
+    - alert: PodCrashLooping
+      expr: changes(kube_pod_container_status_restarts_total{namespace="autofixops", pod=~"autofixops-target-app-.*"}[5m]) >= 3
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Pod CrashLooping Detected"
+        description: "Pod {{ $labels.pod }} has restarted more than 3 times in 5 minutes."

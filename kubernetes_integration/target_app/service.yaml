@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: target-app-service
+  namespace: autofixops
+  labels:
+    app: target-app
+    system: autofixops
+spec:
+  selector:
+    app: target-app
+    system: autofixops
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: ClusterIP
