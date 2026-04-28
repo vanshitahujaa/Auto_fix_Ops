@@ -104,15 +104,15 @@ export default function ChaosPage() {
             <div className="chaos-card" key={fault.id}>
               <h4>{fault.icon} {fault.name}</h4>
               <p>{fault.desc}</p>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }}>
-                Severity: <span style={{ color: fault.severity === 'HIGH' ? 'var(--error)' : 'var(--warning)' }}>
+              <div className="severity-row">
+                Severity: <span style={{ color: fault.severity === 'HIGH' ? 'var(--error)' : 'var(--warning)', fontWeight: 600 }}>
                   {fault.severity}
                 </span>
               </div>
               <div className="confirm-input">
                 <input
                   type="text"
-                  placeholder='Type "CONFIRM"'
+                  placeholder='Type "CONFIRM" to unlock'
                   value={confirms[fault.id] || ''}
                   onChange={(e) => setConfirms((c) => ({ ...c, [fault.id]: e.target.value }))}
                 />
@@ -121,18 +121,19 @@ export default function ChaosPage() {
                   disabled={loading[fault.id] || confirms[fault.id] !== 'CONFIRM'}
                   onClick={() => handleInject(fault.id)}
                 >
-                  {loading[fault.id] ? <span className="loading-spinner" /> : 'Inject'}
+                  {loading[fault.id] ? <span className="loading-spinner" /> : '⚡ Inject Fault'}
                 </button>
               </div>
               {results[fault.id] && (
                 <div style={{
-                  marginTop: 8,
-                  padding: '6px 10px',
+                  marginTop: 12,
+                  padding: '10px 14px',
                   borderRadius: 'var(--radius)',
                   fontSize: 12,
                   fontFamily: 'var(--font-mono)',
                   background: results[fault.id].type === 'success' ? 'var(--success-bg)' : 'var(--error-bg)',
                   color: results[fault.id].type === 'success' ? 'var(--success)' : 'var(--error)',
+                  border: `1px solid ${results[fault.id].type === 'success' ? 'rgba(16,185,129,0.2)' : 'rgba(239,68,68,0.2)'}`,
                 }}>
                   {results[fault.id].msg}
                 </div>

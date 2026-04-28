@@ -443,64 +443,112 @@ body {
   border: 2px solid var(--danger-red);
   border-radius: var(--radius-lg);
   background: var(--danger-bg);
-  padding: 24px;
+  padding: 28px;
 }
 
 .chaos-zone .chaos-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 16px;
+  gap: 10px;
+  margin-bottom: 24px;
   color: var(--error);
   font-weight: 700;
-  font-size: 16px;
+  font-size: 18px;
+  letter-spacing: -0.3px;
 }
 
 .chaos-cards {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+}
+
+@media (max-width: 1100px) {
+  .chaos-cards {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 700px) {
+  .chaos-cards {
+    grid-template-columns: 1fr;
+  }
 }
 
 .chaos-card {
   background: rgba(220,38,38,0.05);
   border: 1px solid rgba(220,38,38,0.2);
-  border-radius: var(--radius);
-  padding: 20px;
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  min-height: 220px;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.chaos-card:hover {
+  border-color: rgba(220,38,38,0.4);
+  background: rgba(220,38,38,0.08);
 }
 
 .chaos-card h4 {
   color: var(--error);
-  font-size: 14px;
-  margin-bottom: 6px;
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 8px;
+  letter-spacing: -0.2px;
 }
 
 .chaos-card p {
-  font-size: 12px;
-  color: var(--text-muted);
+  font-size: 13px;
+  color: var(--text-secondary);
   margin-bottom: 12px;
+  line-height: 1.5;
+}
+
+.chaos-card .severity-row {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid rgba(220,38,38,0.15);
+  margin-bottom: 16px;
 }
 
 /* ─── Confirm Input ─── */
 .confirm-input {
   display: flex;
-  gap: 8px;
-  margin-top: 8px;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 0;
 }
 
 .confirm-input input {
-  flex: 1;
-  padding: 8px 12px;
+  width: 100%;
+  padding: 10px 14px;
   background: var(--bg-primary);
-  border: 1px solid var(--danger-red);
+  border: 1px solid rgba(220,38,38,0.4);
   border-radius: var(--radius);
   color: var(--error);
   font-family: var(--font-mono);
   font-size: 13px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.confirm-input input:focus {
+  outline: none;
+  border-color: var(--danger-red);
+  box-shadow: 0 0 0 3px rgba(220,38,38,0.15);
 }
 
 .confirm-input input::placeholder {
-  color: rgba(239,68,68,0.4);
+  color: rgba(239,68,68,0.35);
+}
+
+.confirm-input .btn-danger {
+  width: 100%;
+  justify-content: center;
+  padding: 10px 16px;
 }
 
 /* ─── Policy Breakdown ─── */
