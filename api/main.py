@@ -540,15 +540,28 @@ async def rollback_patch(incident_id: str, db: Session = Depends(get_db)):
     if not audit.previous_values:
         raise HTTPException(status_code=409, detail="No previous values stored — rollback not possible.")
 
-    # TODO: In Phase 8c, this will create a revert PR with the previous_values
-    logger.info(f"[ROLLBACK] Rollback requested for incident {incident_id}. Previous values: {audit.previous_values}")
+    project_config = get_project_config(str(audit.project_id)) if audit.project_id else {}
+    from engine.remediation import RemediationEngine
+    engine = RemediationEngine(project_config)
 
-    return {
-        "status": "rollback_queued",
-        "incident_id": incident_id,
-        "previous_values": audit.previous_values,
-        "message": "Rollback PR will be created with the stored previous values.",
-    }
+    try:
+        result = engine.execute_rollback(incident_id, audit.previous_values)
+        
+        try:
+            from .events import emit_sync
+            emit_sync("remediation.pr_created", {"pr_url": result.get("pr_url"), "is_shadow": False}, incident_id)
+        except Exception as e:
+            logger.error(f"[WS] Failed to emit rollback pr_created: {e}")
+            
+        return {
+            "status": "rollback_created",
+            "incident_id": incident_id,
+            "pr_url": result.get("pr_url"),
+            "message": "Rollback PR has been created successfully.",
+        }
+    except Exception as e:
+        logger.error(f"[ROLLBACK ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create rollback PR: {e}")
 
 
 # ════════════════════════════════════════════════════════════

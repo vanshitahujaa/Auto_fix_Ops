@@ -223,6 +223,59 @@ class RemediationEngine:
             "previous_values": previous_values,
         }
 
+    def execute_rollback(self, incident_id: str, previous_values: Dict[str, Any]) -> Dict[str, Any]:
+        """Creates a rollback PR reverting the manifest to the stored previous_values."""
+        if not self.github:
+            logger.warning(f"[TRACE:{incident_id}] [ROLLBACK] No GitHub token. Simulating rollback.")
+            return {"pr_url": f"https://github.com/mock/pull/rollback-{incident_id[:8]}"}
+
+        repo = self.github.get_repo(self.github_repo)
+        branch_name = f"autofixops/rollback-{incident_id[:8]}"
+        default_branch = repo.default_branch
+
+        try:
+            file_content = repo.get_contents(self.manifest_path, ref=default_branch)
+            current_yaml = yaml.safe_load(file_content.decoded_content.decode("utf-8"))
+        except GithubException as e:
+            logger.error(f"[TRACE:{incident_id}] Failed to fetch manifest for rollback: {e}")
+            raise
+
+        reverted_yaml = self.patch_generator.apply_rollback(current_yaml, previous_values)
+        reverted_content = yaml.dump(reverted_yaml, default_flow_style=False)
+
+        source_branch = repo.get_branch(default_branch)
+        try:
+            repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=source_branch.commit.sha)
+        except GithubException:
+            logger.warning(f"[TRACE:{incident_id}] Rollback branch {branch_name} already exists.")
+
+        repo.update_file(
+            path=self.manifest_path,
+            message=f"revert(autofixops): rollback for incident {incident_id[:8]}",
+            content=reverted_content,
+            sha=file_content.sha,
+            branch=branch_name,
+        )
+
+        pr_title = f"[ROLLBACK] AutoFixOps — Incident {incident_id[:8]}"
+        pr_body = (
+            f"## ⏪ AutoFixOps Rollback\n\n"
+            f"Reverting manifest changes made during Incident `{incident_id}`.\n\n"
+            f"### Restored Values:\n"
+            + "".join(f"- `{k}`: `{v}`\n" for k, v in previous_values.items())
+        )
+
+        pr = repo.create_pull(
+            title=pr_title,
+            body=pr_body,
+            head=branch_name,
+            base=default_branch,
+            draft=False,  # Rollbacks shouldn't be drafts
+        )
+
+        logger.info(f"[TRACE:{incident_id}] [ROLLBACK DONE] PR #{pr.number} created: {pr.html_url}")
+        return {"pr_url": pr.html_url, "pr_number": pr.number, "branch_name": branch_name}
+
     def _execute_simulated(
         self,
         incident_id: str,

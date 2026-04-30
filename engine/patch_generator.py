@@ -112,6 +112,54 @@ class PatchGenerator:
         logger.info(f"[PATCH] Generated patch for action: {action_type}")
         return patched, self.previous_values
 
+    def apply_rollback(self, manifest: Dict[str, Any], previous_values: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Takes a manifest and a previous_values dict (from RemediationAudit),
+        and reverts the manifest exactly to those stored values.
+        """
+        patched = copy.deepcopy(manifest)
+        
+        # 1. Revert container resources and images
+        try:
+            containers = self._get_containers(patched)
+        except ValueError:
+            containers = []
+            
+        for container in containers:
+            c_name = container.get("name", "default")
+            
+            # Memory
+            mem_key = f"memory_limit_{c_name}"
+            if mem_key in previous_values:
+                container.setdefault("resources", {}).setdefault("limits", {})["memory"] = previous_values[mem_key]
+                
+            # CPU
+            cpu_key = f"cpu_limit_{c_name}"
+            if cpu_key in previous_values:
+                container.setdefault("resources", {}).setdefault("limits", {})["cpu"] = previous_values[cpu_key]
+                
+            # Image
+            img_key = f"image_{c_name}"
+            if img_key in previous_values:
+                container["image"] = previous_values[img_key]
+                
+        # 2. Revert restart annotation
+        if "restart_annotation" in previous_values:
+            old_restart = previous_values["restart_annotation"]
+            annotations = (
+                patched.get("spec", {})
+                .get("template", {})
+                .setdefault("metadata", {})
+                .setdefault("annotations", {})
+            )
+            if old_restart == "never" and "kubectl.kubernetes.io/restartedAt" in annotations:
+                del annotations["kubectl.kubernetes.io/restartedAt"]
+            elif old_restart != "never":
+                annotations["kubectl.kubernetes.io/restartedAt"] = old_restart
+
+        logger.info(f"[PATCH] Applied rollback for {len(previous_values)} previous values.")
+        return patched
+
     def _patch_memory_limit(self, manifest: Dict, action: Dict):
         """Patches memory limit with bounds checking."""
         requested_value = action.get("patch_value", "256Mi")
