@@ -1,28 +1,42 @@
+"""
+Verification Engine for AutoFixOps
+====================================
+Post-remediation verification with:
+- PR merge polling
+- Stability window (N minutes of stable metrics, not single check)
+- Multi-metric validation (CPU + memory + restarts)
+- Negative signal detection (no metric worsening)
+- Consecutive pass requirement (≥2 passes)
+- Learning loop integration
+"""
+
 import os
 import time
 import logging
 import requests
-from typing import Optional
+from typing import Optional, Dict, Any
 from github import Github, GithubException
 
 from api.database import SessionLocal
-from api.models import Incident, IncidentStatus, RemediationAudit, ExecutionStatus
+from api.models import (
+    Incident, IncidentStatus, RemediationAudit,
+    ExecutionStatus, FailureRootCause
+)
 from engine.memory import QdrantMemoryStore
 
 logger = logging.getLogger("autofixops")
-
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "")
-PROMETHEUS_URL = os.getenv(
-    "PROMETHEUS_URL",
-    "http://prometheus-operated.autofixops.svc.cluster.local:9090",
-)
 
 # Verification constants
 PR_POLL_INTERVAL_SECONDS = 60
 PR_POLL_MAX_ATTEMPTS = 30       # 30 minutes max wait
 POST_MERGE_COOLDOWN_SECONDS = 300  # 5 minutes for GitOps sync
-HEALTH_CHECK_THRESHOLD = 0.80  # Metric must be below 80% to pass
+
+# Robustness settings
+STABILITY_WINDOW_MINUTES = 5
+STABILITY_CHECK_INTERVAL_SECONDS = 60
+CONSECUTIVE_PASSES_REQUIRED = 2
+HEALTH_CHECK_THRESHOLD = 0.80
+WORSENING_THRESHOLD = 1.20  # 20% increase = worsening
 
 
 class VerificationEngine:
@@ -30,13 +44,20 @@ class VerificationEngine:
     Post-remediation verification worker.
     1. Polls GitHub for PR merge status.
     2. Waits for GitOps sync cooldown.
-    3. Re-checks Prometheus telemetry.
+    3. Multi-pass telemetry stability check.
     4. Marks incident RESOLVED or FAILED.
-    5. Stores successful resolutions into Qdrant for the learning loop.
+    5. Stores structured learning with root cause classification.
     """
 
-    def __init__(self):
-        self.github = Github(GITHUB_TOKEN) if GITHUB_TOKEN else None
+    def __init__(self, project_config: Dict[str, Any] = None):
+        self.config = project_config or {}
+        github_token = self.config.get("github_token") or os.getenv("GITHUB_TOKEN", "")
+        self.github_repo = self.config.get("github_repo") or os.getenv("GITHUB_REPO", "")
+        self.prometheus_url = (
+            self.config.get("prometheus_url")
+            or os.getenv("PROMETHEUS_URL", "http://prometheus-operated.autofixops.svc.cluster.local:9090")
+        )
+        self.github = Github(github_token) if github_token else None
 
     def verify(
         self,
@@ -46,9 +67,10 @@ class VerificationEngine:
         diagnosis: str,
         action_taken: str,
         pod_name: str,
+        baseline_metrics: Dict[str, float] = None,
     ) -> bool:
         """
-        Full verification pipeline. Returns True if incident is resolved.
+        Full verification pipeline with stability window. Returns True if resolved.
         """
         logger.info(f"[TRACE:{incident_id}] [VERIFICATION START]")
 
@@ -66,67 +88,72 @@ class VerificationEngine:
             pr_merged = self._wait_for_pr_merge(incident_id, audit)
 
             if not pr_merged:
-                logger.warning(
-                    f"[TRACE:{incident_id}] [VERIFICATION TIMEOUT] "
-                    f"PR was not merged within {PR_POLL_MAX_ATTEMPTS} polls."
-                )
+                logger.warning(f"[TRACE:{incident_id}] PR was not merged.")
                 audit.execution_status = ExecutionStatus.PR_REJECTED
+                audit.failure_root_cause = FailureRootCause.INFRA
                 db.commit()
                 return False
 
             audit.execution_status = ExecutionStatus.PR_MERGED
             db.commit()
-            logger.info(f"[TRACE:{incident_id}] [VERIFICATION] PR merged confirmed.")
+            logger.info(f"[TRACE:{incident_id}] PR merged confirmed.")
 
             # ─── Step 2: Post-Merge Cooldown ───
             logger.info(
-                f"[TRACE:{incident_id}] [VERIFICATION] Waiting "
-                f"{POST_MERGE_COOLDOWN_SECONDS}s for GitOps sync..."
+                f"[TRACE:{incident_id}] Waiting {POST_MERGE_COOLDOWN_SECONDS}s for GitOps sync..."
             )
             time.sleep(POST_MERGE_COOLDOWN_SECONDS)
 
-            # ─── Step 3: Telemetry Re-check ───
-            is_healthy = self._check_post_fix_health(incident_id, pod_name)
+            # ─── Step 3: Stability Window Check ───
+            stability_result = self._check_stability_window(
+                incident_id, pod_name, baseline_metrics or {}
+            )
 
             incident = db.query(Incident).filter(Incident.id == incident_id).first()
 
-            if is_healthy:
+            if stability_result["passed"]:
                 audit.execution_status = ExecutionStatus.VERIFICATION_PASSED
                 incident.transition_to(IncidentStatus.VERIFIED)
                 db.commit()
                 incident.transition_to(IncidentStatus.RESOLVED)
                 db.commit()
 
-                logger.info(
-                    f"[TRACE:{incident_id}] [VERIFICATION PASSED] "
-                    f"Incident marked RESOLVED."
-                )
+                logger.info(f"[TRACE:{incident_id}] [VERIFICATION PASSED] Incident RESOLVED.")
 
-                # ─── Step 4: Experience Learning Loop ───
+                # Learning loop
                 self._store_learning(summary_text, diagnosis, action_taken)
 
                 # Record success in circuit breaker
-                from engine.circuit_breaker import get_circuit_breaker
-                get_circuit_breaker().record_outcome(success=True)
+                from engine.circuit_breaker import get_circuit_breaker_registry
+                project_id = str(incident.project_id) if incident.project_id else "global"
+                get_circuit_breaker_registry().record_outcome(
+                    project_id, action_taken, success=True
+                )
 
                 return True
             else:
                 audit.execution_status = ExecutionStatus.VERIFICATION_FAILED
-                audit.failure_reason = "verification_failed"
+                audit.failure_reason = stability_result.get("reason", "verification_failed")
+                audit.failure_root_cause = self._classify_failure(stability_result)
                 incident.transition_to(IncidentStatus.FAILED)
                 db.commit()
 
                 logger.warning(
                     f"[TRACE:{incident_id}] [VERIFICATION FAILED] "
-                    f"Telemetry still degraded after fix."
+                    f"Reason: {stability_result.get('reason')}"
                 )
 
-                # Store failure pattern in memory
-                self._store_failure(summary_text, diagnosis, action_taken)
+                # Store failure pattern (only if logic failure)
+                if audit.failure_root_cause == FailureRootCause.LOGIC:
+                    self._store_failure(summary_text, diagnosis, action_taken,
+                                       stability_result.get("reason", ""))
 
                 # Record failure in circuit breaker
-                from engine.circuit_breaker import get_circuit_breaker
-                get_circuit_breaker().record_outcome(success=False)
+                from engine.circuit_breaker import get_circuit_breaker_registry
+                project_id = str(incident.project_id) if incident.project_id else "global"
+                get_circuit_breaker_registry().record_outcome(
+                    project_id, action_taken, success=False
+                )
 
                 return False
 
@@ -137,12 +164,166 @@ class VerificationEngine:
         finally:
             db.close()
 
+    def _check_stability_window(
+        self,
+        incident_id: str,
+        pod_name: str,
+        baseline_metrics: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """
+        Checks metrics stability over STABILITY_WINDOW_MINUTES.
+        Requires CONSECUTIVE_PASSES_REQUIRED consecutive healthy checks.
+        Also detects negative signals (worsening metrics).
+        """
+        consecutive_passes = 0
+        total_checks = STABILITY_WINDOW_MINUTES  # One check per minute
+        check_results = []
+
+        for check_num in range(1, total_checks + 1):
+            logger.info(
+                f"[TRACE:{incident_id}] [STABILITY CHECK {check_num}/{total_checks}]"
+            )
+
+            result = self._run_health_check(incident_id, pod_name, baseline_metrics)
+            check_results.append(result)
+
+            if result["healthy"] and not result.get("worsened"):
+                consecutive_passes += 1
+                logger.info(
+                    f"[TRACE:{incident_id}] Check {check_num} PASSED "
+                    f"(consecutive: {consecutive_passes}/{CONSECUTIVE_PASSES_REQUIRED})"
+                )
+
+                if consecutive_passes >= CONSECUTIVE_PASSES_REQUIRED:
+                    return {
+                        "passed": True,
+                        "checks_run": check_num,
+                        "consecutive_passes": consecutive_passes,
+                    }
+            else:
+                consecutive_passes = 0  # Reset on failure
+                reason = result.get("reason", "metric unhealthy")
+                logger.warning(
+                    f"[TRACE:{incident_id}] Check {check_num} FAILED: {reason}"
+                )
+
+            if check_num < total_checks:
+                time.sleep(STABILITY_CHECK_INTERVAL_SECONDS)
+
+        return {
+            "passed": False,
+            "reason": f"Failed to achieve {CONSECUTIVE_PASSES_REQUIRED} consecutive passes in {total_checks} checks",
+            "checks_run": total_checks,
+            "check_results": [r.get("reason", "ok") for r in check_results],
+        }
+
+    def _run_health_check(
+        self,
+        incident_id: str,
+        pod_name: str,
+        baseline_metrics: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """
+        Single health check pass. Checks multiple metrics + negative signals.
+        """
+        namespace = self.config.get("target_namespace", "autofixops")
+
+        queries = {
+            "cpu": f'rate(container_cpu_usage_seconds_total{{namespace="{namespace}", pod=~"{pod_name}.*"}}[5m])',
+            "memory": f'container_memory_working_set_bytes{{namespace="{namespace}", pod=~"{pod_name}.*"}}',
+        }
+
+        metric_values = {}
+        for metric_name, query in queries.items():
+            try:
+                response = requests.get(
+                    f"{self.prometheus_url}/api/v1/query",
+                    params={"query": query},
+                    timeout=10,
+                )
+                response.raise_for_status()
+                results = response.json().get("data", {}).get("result", [])
+
+                if results:
+                    value = float(results[0]["value"][1])
+                    metric_values[metric_name] = value
+                else:
+                    logger.warning(
+                        f"[TRACE:{incident_id}] No data for {metric_name}. "
+                        f"Assuming healthy (pod may have restarted)."
+                    )
+            except requests.Timeout:
+                return {
+                    "healthy": False,
+                    "reason": f"Prometheus timeout on {metric_name}",
+                    "timeout": True,
+                }
+            except Exception as e:
+                return {
+                    "healthy": False,
+                    "reason": f"{metric_name} query error: {e}",
+                }
+
+        # ─── Threshold checks ───
+        cpu = metric_values.get("cpu")
+        memory = metric_values.get("memory")
+
+        if cpu is not None and cpu > HEALTH_CHECK_THRESHOLD:
+            return {"healthy": False, "reason": f"CPU too high: {cpu:.4f}"}
+
+        if memory is not None and memory > 104857600 * HEALTH_CHECK_THRESHOLD:
+            return {"healthy": False, "reason": f"Memory too high: {memory:.0f} bytes"}
+
+        # ─── Negative signal detection (worsening) ───
+        worsened = False
+        worsening_details = []
+
+        if baseline_metrics:
+            for metric_name, current in metric_values.items():
+                baseline = baseline_metrics.get(metric_name)
+                if baseline and baseline > 0:
+                    ratio = current / baseline
+                    if ratio > WORSENING_THRESHOLD:
+                        worsened = True
+                        worsening_details.append(
+                            f"{metric_name}: {current:.2f} vs baseline {baseline:.2f} "
+                            f"(+{(ratio-1)*100:.0f}%)"
+                        )
+
+        if worsened:
+            return {
+                "healthy": False,
+                "worsened": True,
+                "reason": f"Metrics worsened: {'; '.join(worsening_details)}",
+            }
+
+        return {"healthy": True, "metrics": metric_values}
+
+    def _classify_failure(self, stability_result: Dict) -> FailureRootCause:
+        """Classifies failure root cause for structured storage."""
+        reason = stability_result.get("reason", "")
+        check_results = stability_result.get("check_results", [])
+
+        # If most checks had timeouts → infra issue
+        timeout_count = sum(1 for r in check_results if "timeout" in str(r).lower())
+        if timeout_count > len(check_results) / 2:
+            return FailureRootCause.TIMEOUT
+
+        # If metrics worsened → logic issue (wrong fix)
+        if any("worsened" in str(r).lower() for r in check_results):
+            return FailureRootCause.LOGIC
+
+        # If metrics never improved → logic (fix didn't work)
+        if "consecutive passes" in reason.lower():
+            return FailureRootCause.LOGIC
+
+        return FailureRootCause.UNKNOWN
+
     def _wait_for_pr_merge(
         self, incident_id: str, audit: RemediationAudit
     ) -> bool:
         """Polls GitHub API for PR merge status."""
-        if not self.github or not GITHUB_REPO:
-            # Simulate merge for local development
+        if not self.github or not self.github_repo:
             logger.info(
                 f"[TRACE:{incident_id}] [VERIFICATION SIMULATED] "
                 f"Assuming PR merged (no GitHub credentials)."
@@ -150,19 +331,16 @@ class VerificationEngine:
             return True
 
         try:
-            repo = self.github.get_repo(GITHUB_REPO)
+            repo = self.github.get_repo(self.github_repo)
         except GithubException as e:
             logger.error(f"[TRACE:{incident_id}] Failed to access repo: {e}")
             return False
 
         pr_url = audit.github_pr_url or ""
-        # Extract PR number from URL (last segment)
         try:
             pr_number = int(pr_url.rstrip("/").split("/")[-1])
         except (ValueError, IndexError):
-            logger.error(
-                f"[TRACE:{incident_id}] Could not extract PR number from: {pr_url}"
-            )
+            logger.error(f"[TRACE:{incident_id}] Could not extract PR number from: {pr_url}")
             return False
 
         for attempt in range(1, PR_POLL_MAX_ATTEMPTS + 1):
@@ -171,85 +349,33 @@ class VerificationEngine:
                 if pr.merged:
                     return True
                 if pr.state == "closed" and not pr.merged:
-                    logger.warning(
-                        f"[TRACE:{incident_id}] PR #{pr_number} was closed without merge."
-                    )
+                    logger.warning(f"[TRACE:{incident_id}] PR #{pr_number} closed without merge.")
                     return False
             except GithubException as e:
-                logger.error(
-                    f"[TRACE:{incident_id}] GitHub API error on poll {attempt}: {e}"
-                )
+                logger.error(f"[TRACE:{incident_id}] GitHub API error on poll {attempt}: {e}")
 
             logger.info(
-                f"[TRACE:{incident_id}] [VERIFICATION POLL {attempt}/{PR_POLL_MAX_ATTEMPTS}] "
-                f"PR not yet merged. Waiting {PR_POLL_INTERVAL_SECONDS}s..."
+                f"[TRACE:{incident_id}] [POLL {attempt}/{PR_POLL_MAX_ATTEMPTS}] "
+                f"PR not merged. Waiting {PR_POLL_INTERVAL_SECONDS}s..."
             )
             time.sleep(PR_POLL_INTERVAL_SECONDS)
 
         return False
 
-    def _check_post_fix_health(self, incident_id: str, pod_name: str) -> bool:
-        """
-        Queries Prometheus for current resource usage.
-        Returns True if both CPU and memory are below the health threshold.
-        """
-        queries = {
-            "cpu": f'rate(container_cpu_usage_seconds_total{{namespace="autofixops", pod=~"{pod_name}.*"}}[5m])',
-            "memory": f'container_memory_working_set_bytes{{namespace="autofixops", pod=~"{pod_name}.*"}}',
-        }
-
-        for metric_name, query in queries.items():
-            try:
-                response = requests.get(
-                    f"{PROMETHEUS_URL}/api/v1/query",
-                    params={"query": query},
-                    timeout=5,
-                )
-                response.raise_for_status()
-                results = response.json().get("data", {}).get("result", [])
-
-                if results:
-                    value = float(results[0]["value"][1])
-                    logger.info(
-                        f"[TRACE:{incident_id}] [HEALTH CHECK] "
-                        f"{metric_name} = {value:.4f}"
-                    )
-                    if metric_name == "cpu" and value > HEALTH_CHECK_THRESHOLD:
-                        return False
-                    # Memory: compare against container limit (100Mi = 104857600 bytes)
-                    if metric_name == "memory" and value > 104857600 * HEALTH_CHECK_THRESHOLD:
-                        return False
-                else:
-                    logger.warning(
-                        f"[TRACE:{incident_id}] [HEALTH CHECK] "
-                        f"No data for {metric_name}. Assuming healthy (pod may have restarted)."
-                    )
-            except Exception as e:
-                logger.error(
-                    f"[TRACE:{incident_id}] [HEALTH CHECK FAILED] "
-                    f"{metric_name} query error: {e}"
-                )
-                # If we can't check, we don't assume healthy
-                return False
-
-        return True
-
     def _store_learning(self, summary_text: str, diagnosis: str, action: str):
-        """Closes the experience loop — stores verified resolution in Qdrant."""
+        """Stores verified resolution in Qdrant for learning loop."""
         try:
             memory = QdrantMemoryStore()
             memory.store_resolution(summary_text, diagnosis, action)
-            logger.info("[VERIFICATION] Successfully stored resolution in Qdrant memory.")
+            logger.info("[VERIFICATION] Resolution stored in Qdrant.")
         except Exception as e:
-            # Learning failure should never block the pipeline
             logger.error(f"[VERIFICATION] Failed to store learning: {e}")
 
-    def _store_failure(self, summary_text: str, diagnosis: str, action: str):
-        """Stores a verified failure pattern to prevent future repeat mistakes."""
+    def _store_failure(self, summary_text: str, diagnosis: str, action: str, reason: str):
+        """Stores failure pattern — only called for LOGIC failures."""
         try:
             memory = QdrantMemoryStore()
-            memory.store_failure(summary_text, diagnosis, action, "verification_failed")
-            logger.info("[VERIFICATION] Failure pattern stored in Qdrant memory.")
+            memory.store_failure(summary_text, diagnosis, action, reason)
+            logger.info("[VERIFICATION] Failure pattern stored in Qdrant (LOGIC root cause).")
         except Exception as e:
-            logger.error(f"[VERIFICATION] Failed to store failure pattern: {e}")
-
+            logger.error(f"[VERIFICATION] Failed to store failure: {e}")

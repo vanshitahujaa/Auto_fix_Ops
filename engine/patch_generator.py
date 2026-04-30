@@ -1,31 +1,95 @@
+"""
+Patch Generator for AutoFixOps
+================================
+Generates deterministic YAML patches for Kubernetes manifests.
+Every patch is bounded and reversible — never LLM-generated.
+
+Safety bounds:
+  - Max 2x increase for any resource (configurable per project)
+  - Stores previous values for rollback
+  - Hard caps per resource type
+"""
+
 import copy
+import re
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger("autofixops")
 
+# ─── Hard caps (absolute maximums regardless of scale factor) ───
+HARD_CAPS = {
+    "memory": "4Gi",     # Never exceed 4Gi
+    "cpu": "4000m",      # Never exceed 4 cores
+}
 
-# ─── Patch Templates ───
-# Each action type maps to a deterministic, controlled mutation.
-# No AI-generated YAML. No freeform text. Just field-level patches.
+
+def parse_memory(value: str) -> int:
+    """Converts Kubernetes memory string to bytes."""
+    if not value or value == "unset":
+        return 0
+    value = str(value).strip()
+    multipliers = {
+        "Ki": 1024, "Mi": 1024**2, "Gi": 1024**3,
+        "K": 1000, "M": 1000**2, "G": 1000**3,
+    }
+    for suffix, mult in multipliers.items():
+        if value.endswith(suffix):
+            return int(float(value[:-len(suffix)]) * mult)
+    return int(value)
+
+
+def format_memory(bytes_val: int) -> str:
+    """Converts bytes back to Kubernetes memory string."""
+    if bytes_val >= 1024**3:
+        return f"{bytes_val // (1024**3)}Gi"
+    if bytes_val >= 1024**2:
+        return f"{bytes_val // (1024**2)}Mi"
+    if bytes_val >= 1024:
+        return f"{bytes_val // 1024}Ki"
+    return str(bytes_val)
+
+
+def parse_cpu(value: str) -> int:
+    """Converts Kubernetes CPU string to millicores."""
+    if not value or value == "unset":
+        return 0
+    value = str(value).strip()
+    if value.endswith("m"):
+        return int(float(value[:-1]))
+    return int(float(value) * 1000)
+
+
+def format_cpu(millicores: int) -> str:
+    """Converts millicores back to Kubernetes CPU string."""
+    if millicores >= 1000 and millicores % 1000 == 0:
+        return str(millicores // 1000)
+    return f"{millicores}m"
+
+
+class PatchBoundsError(Exception):
+    """Raised when a patch exceeds safety bounds."""
+    pass
 
 
 class PatchGenerator:
     """
-    Generates structured YAML-compatible patch dicts for Kubernetes manifests.
-    Every patch is deterministic and testable — never LLM-generated.
+    Generates structured YAML-compatible patches with safety bounds.
+    Tracks previous values for rollback capability.
     """
 
-    def generate(self, action: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]:
+    def __init__(self, max_scale_factor: float = 2.0):
+        self.max_scale_factor = max_scale_factor
+        self.previous_values: Dict[str, Any] = {}
+
+    def generate(
+        self, action: Dict[str, Any], manifest: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
-        Takes an action dict and the current manifest, returns the patched manifest.
+        Takes an action dict and manifest, returns (patched_manifest, previous_values).
         
-        Args:
-            action: {"type": "INCREASE_MEMORY_LIMIT", "patch_value": "256Mi", "target": "..."}
-            manifest: Parsed YAML dict of the target deployment
-            
         Returns:
-            Patched manifest dict ready for serialization.
+            Tuple of (patched_manifest, previous_values_dict)
         """
         action_type = action.get("type")
         
@@ -42,57 +106,88 @@ class PatchGenerator:
 
         # Deep copy to avoid mutating the original
         patched = copy.deepcopy(manifest)
+        self.previous_values = {}
         handler(patched, action)
 
         logger.info(f"[PATCH] Generated patch for action: {action_type}")
-        return patched
+        return patched, self.previous_values
 
     def _patch_memory_limit(self, manifest: Dict, action: Dict):
-        """Patches spec.containers[0].resources.limits.memory"""
-        new_value = action.get("patch_value", "256Mi")
-        containers = (
-            manifest.get("spec", {})
-            .get("template", {})
-            .get("spec", {})
-            .get("containers", [])
-        )
-        if not containers:
-            raise ValueError("No containers found in manifest to patch.")
+        """Patches memory limit with bounds checking."""
+        requested_value = action.get("patch_value", "256Mi")
+        containers = self._get_containers(manifest)
 
         for container in containers:
             resources = container.setdefault("resources", {})
             limits = resources.setdefault("limits", {})
-            old_value = limits.get("memory", "unset")
-            limits["memory"] = new_value
+            old_value = limits.get("memory", "128Mi")
+
+            # Store previous
+            self.previous_values[f"memory_limit_{container.get('name', 'default')}"] = old_value
+
+            # Bounds check
+            old_bytes = parse_memory(old_value)
+            new_bytes = parse_memory(requested_value)
+            max_bytes = int(old_bytes * self.max_scale_factor) if old_bytes > 0 else new_bytes
+            cap_bytes = parse_memory(HARD_CAPS["memory"])
+
+            if new_bytes > max_bytes and old_bytes > 0:
+                bounded_value = format_memory(max_bytes)
+                logger.warning(
+                    f"[PATCH BOUNDS] Memory {requested_value} exceeds {self.max_scale_factor}x of {old_value}. "
+                    f"Capping to {bounded_value}."
+                )
+                new_bytes = max_bytes
+
+            if new_bytes > cap_bytes:
+                logger.warning(f"[PATCH BOUNDS] Memory exceeds hard cap. Capping to {HARD_CAPS['memory']}.")
+                new_bytes = cap_bytes
+
+            final_value = format_memory(new_bytes)
+            limits["memory"] = final_value
             logger.info(
                 f"[PATCH] Container '{container.get('name')}': "
-                f"memory limit {old_value} → {new_value}"
+                f"memory limit {old_value} → {final_value}"
             )
 
     def _patch_cpu_limit(self, manifest: Dict, action: Dict):
-        """Patches spec.containers[0].resources.limits.cpu"""
-        new_value = action.get("patch_value", "1000m")
-        containers = (
-            manifest.get("spec", {})
-            .get("template", {})
-            .get("spec", {})
-            .get("containers", [])
-        )
-        if not containers:
-            raise ValueError("No containers found in manifest to patch.")
+        """Patches CPU limit with bounds checking."""
+        requested_value = action.get("patch_value", "1000m")
+        containers = self._get_containers(manifest)
 
         for container in containers:
             resources = container.setdefault("resources", {})
             limits = resources.setdefault("limits", {})
-            old_value = limits.get("cpu", "unset")
-            limits["cpu"] = new_value
+            old_value = limits.get("cpu", "500m")
+
+            self.previous_values[f"cpu_limit_{container.get('name', 'default')}"] = old_value
+
+            old_mc = parse_cpu(old_value)
+            new_mc = parse_cpu(requested_value)
+            max_mc = int(old_mc * self.max_scale_factor) if old_mc > 0 else new_mc
+            cap_mc = parse_cpu(HARD_CAPS["cpu"])
+
+            if new_mc > max_mc and old_mc > 0:
+                bounded_value = format_cpu(max_mc)
+                logger.warning(
+                    f"[PATCH BOUNDS] CPU {requested_value} exceeds {self.max_scale_factor}x of {old_value}. "
+                    f"Capping to {bounded_value}."
+                )
+                new_mc = max_mc
+
+            if new_mc > cap_mc:
+                logger.warning(f"[PATCH BOUNDS] CPU exceeds hard cap. Capping to {HARD_CAPS['cpu']}.")
+                new_mc = cap_mc
+
+            final_value = format_cpu(new_mc)
+            limits["cpu"] = final_value
             logger.info(
                 f"[PATCH] Container '{container.get('name')}': "
-                f"cpu limit {old_value} → {new_value}"
+                f"cpu limit {old_value} → {final_value}"
             )
 
     def _patch_restart_annotation(self, manifest: Dict, action: Dict):
-        """Adds/updates kubectl.kubernetes.io/restartedAt annotation to force rollout."""
+        """Adds restart annotation to force rollout."""
         import datetime
 
         template_metadata = (
@@ -101,16 +196,30 @@ class PatchGenerator:
             .setdefault("metadata", {})
         )
         annotations = template_metadata.setdefault("annotations", {})
+        old_restart = annotations.get("kubectl.kubernetes.io/restartedAt", "never")
+        self.previous_values["restart_annotation"] = old_restart
+
         restart_time = datetime.datetime.utcnow().isoformat() + "Z"
         annotations["kubectl.kubernetes.io/restartedAt"] = restart_time
         logger.info(f"[PATCH] Added restart annotation: {restart_time}")
 
     def _patch_rollback(self, manifest: Dict, action: Dict):
-        """
-        Rollback strategy: revert the image tag to a known-good version.
-        In production this would query the deployment history.
-        For now we append ':previous' as a marker.
-        """
+        """Rollback: revert image tag."""
+        containers = self._get_containers(manifest)
+
+        for container in containers:
+            current_image = container.get("image", "unknown:latest")
+            self.previous_values[f"image_{container.get('name', 'default')}"] = current_image
+
+            base_image = current_image.rsplit(":", 1)[0]
+            container["image"] = f"{base_image}:rollback"
+            logger.info(
+                f"[PATCH] Container '{container.get('name')}': "
+                f"image {current_image} → {container['image']}"
+            )
+
+    def _get_containers(self, manifest: Dict) -> list:
+        """Extracts containers list from manifest."""
         containers = (
             manifest.get("spec", {})
             .get("template", {})
@@ -119,13 +228,4 @@ class PatchGenerator:
         )
         if not containers:
             raise ValueError("No containers found in manifest to patch.")
-
-        for container in containers:
-            current_image = container.get("image", "unknown:latest")
-            # Strip current tag and apply rollback marker
-            base_image = current_image.rsplit(":", 1)[0]
-            container["image"] = f"{base_image}:rollback"
-            logger.info(
-                f"[PATCH] Container '{container.get('name')}': "
-                f"image {current_image} → {container['image']}"
-            )
+        return containers

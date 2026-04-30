@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, Enum, JSON, ForeignKey, Float, Text
+from sqlalchemy import Column, String, DateTime, Enum, JSON, ForeignKey, Float, Text, Integer
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 import uuid
@@ -44,11 +44,27 @@ class ExecutionStatus(str, enum.Enum):
     VERIFICATION_FAILED = "VERIFICATION_FAILED"
 
 
+class SystemMode(str, enum.Enum):
+    """Global kill switch modes."""
+    ACTIVE = "ACTIVE"
+    SHADOW = "SHADOW"
+    DISABLED = "DISABLED"
+
+
+class FailureRootCause(str, enum.Enum):
+    """Structured failure root cause classification."""
+    INFRA = "INFRA"
+    LOGIC = "LOGIC"
+    TIMEOUT = "TIMEOUT"
+    UNKNOWN = "UNKNOWN"
+
+
 class Incident(Base):
     __tablename__ = "incidents"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    alert_fingerprint = Column(String, unique=True, index=True, nullable=False)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("project_config.id"), nullable=True, index=True)
+    alert_fingerprint = Column(String, index=True, nullable=False)
     status = Column(Enum(IncidentStatus, name="incident_status"), default=IncidentStatus.INGESTED, nullable=False)
     severity = Column(String, nullable=False)
     alert_name = Column(String, nullable=False)
@@ -60,12 +76,16 @@ class Incident(Base):
     diagnosis_reasoning = Column(Text, nullable=True)
     diagnosed_by = Column(String, nullable=True)  # "RULE_ENGINE" or "AI_ENGINE"
 
+    # Target resolution (populated by target resolver before remediation)
+    resolved_target = Column(JSON, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
     resolved_at = Column(DateTime, nullable=True)
 
-    # Relationship to audit trail
+    # Relationships
     remediation_audits = relationship("RemediationAudit", back_populates="incident")
+    project = relationship("ProjectConfig", back_populates="incidents")
 
     def transition_to(self, new_status: IncidentStatus):
         """Enforces valid state transitions. Raises ValueError on illegal jumps."""
@@ -85,8 +105,10 @@ class RemediationAudit(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     incident_id = Column(UUID(as_uuid=True), ForeignKey("incidents.id"), nullable=False)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("project_config.id"), nullable=True, index=True)
     proposed_action = Column(String, nullable=False)
     patch_details = Column(JSON, nullable=True)       # The exact YAML diff applied
+    previous_values = Column(JSON, nullable=True)     # Pre-patch values for rollback
     policy_verdict = Column(String, nullable=False)     # APPROVED / ESCALATED / REJECTED
     policy_reason = Column(Text, nullable=True)
     github_pr_url = Column(String, nullable=True)
@@ -104,6 +126,10 @@ class RemediationAudit(Base):
     is_shadow_run = Column(String, default="false")  # "true" / "false"
     human_agreed = Column(String, nullable=True)      # "true" / "false" / None (pending)
     failure_reason = Column(String, nullable=True)     # verification_failed, policy_blocked, invalid_patch
+    failure_root_cause = Column(
+        Enum(FailureRootCause, name="failure_root_cause"),
+        nullable=True
+    )
 
     # Relationship back to parent incident
     incident = relationship("Incident", back_populates="remediation_audits")
@@ -111,12 +137,13 @@ class RemediationAudit(Base):
 
 class ProjectConfig(Base):
     """
-    Singleton project configuration. Only one row ever exists (id=1).
+    Multi-tenant project configuration. Each project gets its own row.
     GitHub token is encrypted at rest using Fernet (AES-128-CBC).
     """
     __tablename__ = "project_config"
 
-    id = Column(String, primary_key=True, default="singleton")
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String, nullable=False, default="Default Project")
     github_repo = Column(String, nullable=True)
     github_token_encrypted = Column(Text, nullable=True)  # Never stored in plaintext
     prometheus_url = Column(String, nullable=True)
@@ -125,8 +152,15 @@ class ProjectConfig(Base):
     shadow_mode = Column(String, default="true")
     confidence_threshold = Column(Float, default=0.80)
 
+    # Safety bounds
+    allowed_chaos_namespaces = Column(JSON, default=["staging", "test", "dev", "default", "autofixops"])
+    max_resource_scale_factor = Column(Float, default=2.0)  # Max 2x increase
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    # Relationships
+    incidents = relationship("Incident", back_populates="project")
 
     @staticmethod
     def _get_fernet():
@@ -161,3 +195,21 @@ class ProjectConfig(Base):
         if not token or len(token) < 8:
             return "***"
         return token[:4] + "****" + token[-4:]
+
+
+class SystemConfig(Base):
+    """
+    Global system configuration — kill switch, mode control.
+    Exactly one row (id='global'). Checked at top of every Celery task.
+    """
+    __tablename__ = "system_config"
+
+    id = Column(String, primary_key=True, default="global")
+    system_mode = Column(
+        Enum(SystemMode, name="system_mode"),
+        default=SystemMode.ACTIVE,
+        nullable=False
+    )
+    disabled_reason = Column(Text, nullable=True)
+    disabled_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)

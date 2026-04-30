@@ -6,6 +6,9 @@ Each task reads the current state, does its work, commits the new state,
 then dispatches the next task. If any task fails, it sets FAILED and
 stops the chain.
 
+All tasks check SYSTEM_MODE at the top — DISABLED = immediate return.
+All tasks thread project_id through the pipeline.
+
 Pipeline:
   build_incident_context  →  CONTEXT_BUILT
   diagnose_incident       →  DIAGNOSED
@@ -19,6 +22,7 @@ import time
 from .celery_app import celery_app
 from api.database import SessionLocal, incident_contexts_collection, logger
 from api.models import Incident, IncidentStatus
+from api.config_helpers import get_project_config, get_system_mode, is_system_disabled
 
 # Engine imports
 from engine.summarizer import ContextSummarizer
@@ -28,20 +32,43 @@ from engine.memory import QdrantMemoryStore
 from engine.policy import PolicyDecisionEngine
 from engine.remediation import RemediationEngine
 from engine.verification import VerificationEngine
+from engine.target_resolver import TargetResolver, TargetResolutionError
 
-PROMETHEUS_URL = "http://prometheus-operated.autofixops.svc.cluster.local:9090"
+
+def _check_kill_switch(incident_id: str) -> bool:
+    """Returns True if system is disabled (task should abort)."""
+    if is_system_disabled():
+        logger.warning(
+            f"[TRACE:{incident_id}] [KILL SWITCH] System is DISABLED. "
+            f"Skipping task execution."
+        )
+        return True
+    return False
 
 
-def fetch_prometheus_metric(query: str):
+def _get_prometheus_url(project_id: str = None) -> str:
+    """Gets Prometheus URL from project config or env."""
+    if project_id:
+        config = get_project_config(project_id)
+        if config and config.get("prometheus_url"):
+            return config["prometheus_url"]
+    return "http://prometheus-operated.autofixops.svc.cluster.local:9090"
+
+
+def fetch_prometheus_metric(query: str, prometheus_url: str = None):
     """Executes a promQL query with strict timeouts."""
+    url = prometheus_url or "http://prometheus-operated.autofixops.svc.cluster.local:9090"
     try:
         response = requests.get(
-            f"{PROMETHEUS_URL}/api/v1/query",
+            f"{url}/api/v1/query",
             params={"query": query},
-            timeout=3,
+            timeout=10,
         )
         response.raise_for_status()
         return response.json().get("data", {}).get("result", [])
+    except requests.Timeout:
+        logger.error(f"Prometheus query timed out (10s)")
+        return []
     except Exception as e:
         logger.error(f"Prometheus query failed: {e}")
         return []
@@ -54,6 +81,9 @@ def fetch_prometheus_metric(query: str):
 @celery_app.task(bind=True, max_retries=3)
 def build_incident_context(self, incident_id: str):
     """Gathers telemetry from Prometheus, stores in MongoDB, transitions to CONTEXT_BUILT."""
+    if _check_kill_switch(incident_id):
+        return False
+
     logger.info(f"[TRACE:{incident_id}] === [TASK 1: CONTEXT] START ===")
     db = SessionLocal()
 
@@ -68,16 +98,19 @@ def build_incident_context(self, incident_id: str):
             logger.warning(f"[TRACE:{incident_id}] Already past INGESTED. Skipping.")
             return True
 
+        project_id = str(incident.project_id) if incident.project_id else None
+        prometheus_url = _get_prometheus_url(project_id)
         pod_name = incident.raw_payload_cache.get("labels", {}).get("pod", "unknown")
 
         # Gather evidence
         cpu_query = f'rate(container_cpu_usage_seconds_total{{namespace="autofixops", pod="{pod_name}"}}[1m])'
         mem_query = f'avg_over_time(container_memory_working_set_bytes{{namespace="autofixops", pod="{pod_name}"}}[5m])'
-        cpu_data = fetch_prometheus_metric(cpu_query)
-        mem_data = fetch_prometheus_metric(mem_query)
+        cpu_data = fetch_prometheus_metric(cpu_query, prometheus_url)
+        mem_data = fetch_prometheus_metric(mem_query, prometheus_url)
 
         context_doc = {
             "incident_id": incident_id,
+            "project_id": project_id,
             "metrics": {"cpu": cpu_data, "memory": mem_data},
             "timestamp": time.time(),
             "target_pod": pod_name,
@@ -115,6 +148,9 @@ def build_incident_context(self, incident_id: str):
 @celery_app.task(bind=True, max_retries=2)
 def diagnose_incident(self, incident_id: str):
     """Runs Rule Engine first. Falls through to AI on UNKNOWN. Stores verdict on Incident."""
+    if _check_kill_switch(incident_id):
+        return False
+
     logger.info(f"[TRACE:{incident_id}] === [TASK 2: DIAGNOSIS] START ===")
     db = SessionLocal()
 
@@ -202,6 +238,9 @@ def diagnose_incident(self, incident_id: str):
 @celery_app.task(bind=True, max_retries=1)
 def evaluate_policy(self, incident_id: str, verdict: dict):
     """Evaluates the diagnosis against policy gates. Routes to remediation or escalation."""
+    if _check_kill_switch(incident_id):
+        return False
+
     logger.info(f"[TRACE:{incident_id}] === [TASK 3: POLICY] START ===")
     db = SessionLocal()
 
@@ -253,12 +292,15 @@ def evaluate_policy(self, incident_id: str, verdict: dict):
 
 
 # ════════════════════════════════════════════════════════════
-# TASK 4: Remediation (GitOps PR)
+# TASK 4: Remediation (GitOps PR) — with target resolution
 # ════════════════════════════════════════════════════════════
 
 @celery_app.task(bind=True, max_retries=2)
 def execute_remediation(self, incident_id: str, verdict: dict):
-    """Creates the GitOps PR with the patched manifest."""
+    """Resolves target, validates, then creates the GitOps PR."""
+    if _check_kill_switch(incident_id):
+        return False
+
     logger.info(f"[TRACE:{incident_id}] === [TASK 4: REMEDIATION] START ===")
     db = SessionLocal()
 
@@ -271,6 +313,47 @@ def execute_remediation(self, incident_id: str, verdict: dict):
             logger.warning(f"[TRACE:{incident_id}] Not in POLICY_APPROVED state. Skipping.")
             return True
 
+        project_id = str(incident.project_id) if incident.project_id else None
+        project_config = get_project_config(project_id) if project_id else {}
+
+        # ─── Circuit breaker check ───
+        from engine.circuit_breaker import get_circuit_breaker_registry
+        action_type = verdict.get("action", {}).get("type", "UNKNOWN")
+
+        if not get_circuit_breaker_registry().should_allow(
+            project_id or "global", action_type
+        ):
+            logger.warning(
+                f"[TRACE:{incident_id}] [CIRCUIT BREAKER] Blocked action {action_type}. "
+                f"Escalating instead."
+            )
+            incident.transition_to(IncidentStatus.ESCALATED)
+            db.commit()
+            return True
+
+        # ─── Target resolution ───
+        resolver = TargetResolver()
+        context_doc = incident_contexts_collection.find_one({"incident_id": incident_id})
+
+        try:
+            resolved_target = resolver.resolve(
+                incident.raw_payload_cache or {},
+                project_config or {},
+                context_doc,
+            )
+        except TargetResolutionError as e:
+            logger.error(f"[TRACE:{incident_id}] [TARGET RESOLUTION FAILED] {e}")
+            _mark_failed(db, incident_id)
+            return False
+
+        # Pre-execution validation
+        if not resolver.validate_target(resolved_target):
+            logger.error(f"[TRACE:{incident_id}] [TARGET VALIDATION FAILED]")
+            _mark_failed(db, incident_id)
+            return False
+
+        # Store resolved target on incident
+        incident.resolved_target = resolved_target
         incident.transition_to(IncidentStatus.REMEDIATING)
         db.commit()
 
@@ -281,7 +364,7 @@ def execute_remediation(self, incident_id: str, verdict: dict):
             f"Reasoning: {incident.diagnosis_reasoning}"
         )
 
-        remediation_engine = RemediationEngine()
+        remediation_engine = RemediationEngine(project_config=project_config)
         result = remediation_engine.execute(incident_id, verdict, summary_text)
 
         incident.transition_to(IncidentStatus.PENDING_PR_MERGE)
@@ -292,6 +375,9 @@ def execute_remediation(self, incident_id: str, verdict: dict):
             f"(PR: {result.get('pr_url')}) ==="
         )
 
+        # Capture baseline metrics for negative signal detection
+        baseline_metrics = resolved_target.get("current_values", {})
+
         # Chain to verification
         pod_name = incident.raw_payload_cache.get("labels", {}).get("pod", "unknown")
         verify_resolution.apply_async(
@@ -300,10 +386,11 @@ def execute_remediation(self, incident_id: str, verdict: dict):
                 result.get("audit_id"),
                 summary_text,
                 incident.diagnosis_classification,
-                verdict.get("action", {}).get("type", "UNKNOWN"),
+                action_type,
                 pod_name,
+                baseline_metrics,
             ],
-            countdown=30,  # Small delay before starting verification
+            countdown=30,
         )
         return True
 
@@ -331,12 +418,26 @@ def verify_resolution(
     diagnosis: str,
     action_taken: str,
     pod_name: str,
+    baseline_metrics: dict = None,
 ):
-    """Polls PR merge, waits for sync, re-checks telemetry, stores learning."""
+    """Polls PR merge, stability window check, stores learning."""
+    if _check_kill_switch(incident_id):
+        return False
+
     logger.info(f"[TRACE:{incident_id}] === [TASK 5: VERIFICATION] START ===")
 
     try:
-        engine = VerificationEngine()
+        # Get project config for this incident
+        db = SessionLocal()
+        try:
+            incident = db.query(Incident).filter(Incident.id == incident_id).first()
+            project_id = str(incident.project_id) if incident and incident.project_id else None
+        finally:
+            db.close()
+
+        project_config = get_project_config(project_id) if project_id else {}
+
+        engine = VerificationEngine(project_config=project_config)
         success = engine.verify(
             incident_id=incident_id,
             audit_id=audit_id,
@@ -344,6 +445,7 @@ def verify_resolution(
             diagnosis=diagnosis,
             action_taken=action_taken,
             pod_name=pod_name,
+            baseline_metrics=baseline_metrics,
         )
 
         if success:

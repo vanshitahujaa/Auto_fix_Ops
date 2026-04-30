@@ -10,8 +10,15 @@ from sqlalchemy import func
 from datetime import datetime, timedelta
 
 from .database import init_relational_db, get_db, incident_contexts_collection, logger
-from .models import Incident, IncidentStatus, RemediationAudit, ExecutionStatus, ProjectConfig
+from .models import (
+    Incident, IncidentStatus, RemediationAudit, ExecutionStatus,
+    ProjectConfig, SystemConfig, SystemMode
+)
 from .schemas import AlertmanagerPayload
+from .config_helpers import (
+    get_project_config, invalidate_config_cache, get_default_project_id,
+    get_system_mode, set_system_mode, is_system_disabled
+)
 from workers.tasks import build_incident_context, execute_remediation
 
 app = FastAPI(title="AutoFixOps API Gateway")
@@ -48,7 +55,7 @@ def generate_dedup_key(alert: dict, window_seconds: int = 120) -> str:
 
 
 # ════════════════════════════════════════════════════════════
-# ENDPOINT 1: Webhook Ingestion
+# ENDPOINT 1: Webhook Ingestion (multi-tenant)
 # ════════════════════════════════════════════════════════════
 
 @app.post("/api/v1/alerts")
@@ -56,6 +63,13 @@ async def receive_alert(
     payload: AlertmanagerPayload, request: Request, db: Session = Depends(get_db)
 ):
     logger.info("=== [INGEST] Received webhook from Alertmanager ===")
+
+    # System kill switch check
+    if is_system_disabled():
+        raise HTTPException(status_code=503, detail="System is DISABLED. No alerts accepted.")
+
+    # Get or create default project
+    default_project_id = get_default_project_id()
     processed_incidents = []
 
     for alert in payload.alerts:
@@ -88,6 +102,7 @@ async def receive_alert(
             severity=severity,
             status=IncidentStatus.INGESTED,
             raw_payload_cache=alert,
+            project_id=default_project_id,
         )
 
         try:
@@ -180,6 +195,7 @@ async def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
             "confidence": incident.diagnosis_confidence,
             "reasoning": incident.diagnosis_reasoning,
             "diagnosed_by": incident.diagnosed_by,
+            "resolved_target": incident.resolved_target,
             "created_at": incident.created_at.isoformat() if incident.created_at else None,
         },
         "telemetry_context": mongo_ctx,
@@ -192,6 +208,8 @@ async def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
                 "execution_status": a.execution_status.value if a.execution_status else None,
                 "is_shadow": a.is_shadow_run,
                 "human_agreed": a.human_agreed,
+                "failure_reason": a.failure_reason,
+                "failure_root_cause": a.failure_root_cause.value if a.failure_root_cause else None,
             }
             for a in audits
         ],
@@ -310,12 +328,18 @@ async def get_metrics(db: Session = Depends(get_db)):
 
 @app.get("/api/v1/status")
 async def get_system_status(db: Session = Depends(get_db)):
-    from engine.circuit_breaker import get_circuit_breaker
-    config = db.query(ProjectConfig).filter(ProjectConfig.id == "singleton").first()
-    breaker = get_circuit_breaker()
+    from engine.circuit_breaker import get_circuit_breaker_registry
+
+    # Get default project config
+    config = db.query(ProjectConfig).first()
+    registry = get_circuit_breaker_registry()
+    system_mode = get_system_mode()
+
     return {
+        "system_mode": system_mode,
         "shadow_mode": config.shadow_mode if config else "true",
-        "circuit_breaker": breaker.state,
+        "circuit_breaker": registry.global_breaker.state,
+        "circuit_breaker_states": registry.get_all_states(),
         "github_connected": bool(config and config.github_token_encrypted),
         "prometheus_url": config.prometheus_url if config else None,
         "target_namespace": config.target_namespace if config else "autofixops",
@@ -323,16 +347,40 @@ async def get_system_status(db: Session = Depends(get_db)):
 
 
 # ════════════════════════════════════════════════════════════
-# ENDPOINT 7: Project Configuration (encrypted token)
+# ENDPOINT 7: System Mode (Kill Switch)
+# ════════════════════════════════════════════════════════════
+
+@app.post("/api/v1/system/mode")
+async def update_system_mode(request: Request):
+    body = await request.json()
+    mode = body.get("mode", "").upper()
+    reason = body.get("reason", "")
+
+    if mode not in ("ACTIVE", "SHADOW", "DISABLED"):
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}. Use ACTIVE, SHADOW, or DISABLED.")
+
+    set_system_mode(mode, reason)
+    return {"status": "updated", "system_mode": mode}
+
+
+@app.get("/api/v1/system/mode")
+async def get_system_mode_endpoint():
+    return {"system_mode": get_system_mode()}
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT 8: Project Configuration (multi-tenant)
 # ════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/config")
 async def get_config(db: Session = Depends(get_db)):
-    config = db.query(ProjectConfig).filter(ProjectConfig.id == "singleton").first()
+    config = db.query(ProjectConfig).first()
     if not config:
         return {"configured": False}
     return {
         "configured": True,
+        "project_id": str(config.id),
+        "name": config.name,
         "github_repo": config.github_repo,
         "github_token": config.get_masked_token(),
         "prometheus_url": config.prometheus_url,
@@ -340,18 +388,21 @@ async def get_config(db: Session = Depends(get_db)):
         "target_manifest_path": config.target_manifest_path,
         "shadow_mode": config.shadow_mode,
         "confidence_threshold": config.confidence_threshold,
+        "allowed_chaos_namespaces": config.allowed_chaos_namespaces,
+        "max_resource_scale_factor": config.max_resource_scale_factor,
     }
 
 
 @app.post("/api/v1/config")
 async def save_config(request: Request, db: Session = Depends(get_db)):
     body = await request.json()
-    config = db.query(ProjectConfig).filter(ProjectConfig.id == "singleton").first()
+    config = db.query(ProjectConfig).first()
 
     if not config:
-        config = ProjectConfig(id="singleton")
+        config = ProjectConfig(name=body.get("name", "Default Project"))
         db.add(config)
 
+    config.name = body.get("name", config.name)
     config.github_repo = body.get("github_repo", config.github_repo)
     config.prometheus_url = body.get("prometheus_url", config.prometheus_url)
     config.target_namespace = body.get("target_namespace", config.target_namespace)
@@ -359,26 +410,42 @@ async def save_config(request: Request, db: Session = Depends(get_db)):
     config.shadow_mode = body.get("shadow_mode", config.shadow_mode)
     config.confidence_threshold = body.get("confidence_threshold", config.confidence_threshold)
 
+    # Safety bounds
+    if "allowed_chaos_namespaces" in body:
+        config.allowed_chaos_namespaces = body["allowed_chaos_namespaces"]
+    if "max_resource_scale_factor" in body:
+        config.max_resource_scale_factor = min(body["max_resource_scale_factor"], 5.0)
+
     # Token: only update if provided (never return raw)
     if body.get("github_token"):
         config.set_github_token(body["github_token"])
 
     db.commit()
-    logger.info("[CONFIG] Project configuration saved.")
-    return {"status": "saved"}
+    db.refresh(config)
+
+    # Invalidate cache
+    invalidate_config_cache(str(config.id))
+
+    logger.info(f"[CONFIG] Project configuration saved (id={config.id}).")
+    return {"status": "saved", "project_id": str(config.id)}
 
 
 # ════════════════════════════════════════════════════════════
-# ENDPOINT 8: Chaos Injection (with safeguards)
+# ENDPOINT 9: Chaos Injection (per-project rate limit + namespace enforcement)
 # ════════════════════════════════════════════════════════════
 
 import httpx
 
-ALLOWED_CHAOS_NAMESPACES = {"autofixops", "staging", "test", "dev", "default"}
-CHAOS_RATE_LIMIT: dict = {}  # Simple in-memory rate limiter
+CHAOS_RATE_LIMIT: dict = {}  # {project_id:fault_type: timestamp}
+CHAOS_COOLDOWN_SECONDS = 60
+
 
 @app.post("/api/v1/chaos/inject")
 async def inject_chaos(request: Request, db: Session = Depends(get_db)):
+    # Kill switch check
+    if is_system_disabled():
+        raise HTTPException(status_code=503, detail="System is DISABLED. Chaos injection blocked.")
+
     body = await request.json()
     fault_type = body.get("fault_type")  # "memory_leak", "cpu_spike", "crash_loop"
     target_url = body.get("target_url")  # e.g. "http://target-app:8000"
@@ -387,24 +454,31 @@ async def inject_chaos(request: Request, db: Session = Depends(get_db)):
     if confirmation != "CONFIRM":
         raise HTTPException(status_code=400, detail="Must type CONFIRM to inject chaos.")
 
-    # Namespace check
-    config = db.query(ProjectConfig).filter(ProjectConfig.id == "singleton").first()
+    # Get project config
+    config = db.query(ProjectConfig).first()
+    project_id = str(config.id) if config else "global"
     namespace = config.target_namespace if config else "autofixops"
-    if namespace not in ALLOWED_CHAOS_NAMESPACES:
+
+    # Namespace enforcement — hard block production
+    allowed_namespaces = config.allowed_chaos_namespaces if config else ["staging", "test", "dev", "default", "autofixops"]
+    if namespace not in (allowed_namespaces or []):
         raise HTTPException(
             status_code=403,
-            detail=f"Chaos injection blocked: namespace '{namespace}' is not in allowed list.",
+            detail=f"Chaos injection blocked: namespace '{namespace}' is not in allowed list {allowed_namespaces}.",
         )
 
-    # Rate limit: max 1 injection per 30 seconds
+    # Per-project + per-fault rate limit
+    rate_key = f"{project_id}:{fault_type}"
     now = time.time()
-    last = CHAOS_RATE_LIMIT.get(fault_type, 0)
-    if now - last < 30:
+    last = CHAOS_RATE_LIMIT.get(rate_key, 0)
+    remaining = CHAOS_COOLDOWN_SECONDS - int(now - last)
+    if remaining > 0:
         raise HTTPException(
             status_code=429,
-            detail=f"Rate limited. Wait {30 - int(now - last)}s before next injection.",
+            detail=f"Rate limited. Wait {remaining}s before next injection.",
+            headers={"Retry-After": str(remaining)},
         )
-    CHAOS_RATE_LIMIT[fault_type] = now
+    CHAOS_RATE_LIMIT[rate_key] = now
 
     # Route to target app endpoint
     endpoint_map = {
@@ -428,6 +502,38 @@ async def inject_chaos(request: Request, db: Session = Depends(get_db)):
             "fault_type": fault_type,
             "target": f"{target_url}{endpoint}",
             "response_code": resp.status_code,
+            "cooldown_seconds": CHAOS_COOLDOWN_SECONDS,
         }
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to reach target: {str(e)}")
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT 10: Patch Rollback
+# ════════════════════════════════════════════════════════════
+
+@app.post("/api/v1/incidents/{incident_id}/rollback")
+async def rollback_patch(incident_id: str, db: Session = Depends(get_db)):
+    """Initiates a rollback using the stored previous_values from the remediation audit."""
+    audit = (
+        db.query(RemediationAudit)
+        .filter(RemediationAudit.incident_id == incident_id)
+        .order_by(RemediationAudit.created_at.desc())
+        .first()
+    )
+
+    if not audit:
+        raise HTTPException(status_code=404, detail="No remediation audit found for this incident.")
+
+    if not audit.previous_values:
+        raise HTTPException(status_code=409, detail="No previous values stored — rollback not possible.")
+
+    # TODO: In Phase 8c, this will create a revert PR with the previous_values
+    logger.info(f"[ROLLBACK] Rollback requested for incident {incident_id}. Previous values: {audit.previous_values}")
+
+    return {
+        "status": "rollback_queued",
+        "incident_id": incident_id,
+        "previous_values": audit.previous_values,
+        "message": "Rollback PR will be created with the stored previous values.",
+    }
