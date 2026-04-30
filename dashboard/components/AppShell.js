@@ -56,8 +56,12 @@ function TopBar({ onModeChange }) {
   useEffect(() => {
     const load = () => api.getStatus().then(setStatus).catch(() => {});
     load();
-    const id = setInterval(load, 10000);
-    return () => clearInterval(id);
+    const cleanup = api.listenEvents((event) => {
+      if (event.type === 'system.mode_changed' || event.type === 'circuit_breaker.state_changed') {
+        load();
+      }
+    });
+    return cleanup;
   }, []);
 
   if (!status) {

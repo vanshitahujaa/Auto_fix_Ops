@@ -2,12 +2,13 @@ import os
 import hashlib
 import time
 from typing import Optional
-from fastapi import FastAPI, Depends, Request, HTTPException, Query
+from fastapi import FastAPI, Depends, Request, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func
 from datetime import datetime, timedelta
+import asyncio
 
 from .database import init_relational_db, get_db, incident_contexts_collection, logger
 from .models import (
@@ -20,6 +21,7 @@ from .config_helpers import (
     get_system_mode, set_system_mode, is_system_disabled
 )
 from workers.tasks import build_incident_context, execute_remediation
+from .events import ws_manager, redis_listener, emit_sync
 
 app = FastAPI(title="AutoFixOps API Gateway")
 
@@ -34,9 +36,13 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
     logger.info("Initializing relational database schema...")
     init_relational_db()
+    
+    # Start Redis WebSocket listener
+    asyncio.create_task(redis_listener(ws_manager))
+    
     logger.info("AutoFixOps API Gateway started successfully.")
 
 
@@ -110,6 +116,12 @@ async def receive_alert(
             db.commit()
             db.refresh(incident)
             logger.info(f"=== [DB WRITE] Created Incident: {incident.id} ===")
+            
+            try:
+                emit_sync("incident.created", {"alert_name": alert_name, "severity": severity}, str(incident.id))
+            except Exception as e:
+                logger.error(f"[WS] Failed to emit incident.created: {e}")
+                
         except IntegrityError:
             db.rollback()
             logger.warning(f"[DB WRITE IGNORED] Deduplicated: {dedup_key}")
@@ -537,3 +549,26 @@ async def rollback_patch(incident_id: str, db: Session = Depends(get_db)):
         "previous_values": audit.previous_values,
         "message": "Rollback PR will be created with the stored previous values.",
     }
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT 11: WebSocket Events
+# ════════════════════════════════════════════════════════════
+
+@app.websocket("/api/v1/events/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time dashboard events.
+    """
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            # We don't expect messages from the client right now,
+            # but we need to keep the connection open and detect disconnects.
+            data = await websocket.receive_text()
+            logger.debug(f"[WS] Received from client: {data}")
+    except WebSocketDisconnect:
+        await ws_manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"[WS] Connection error: {e}")
+        await ws_manager.disconnect(websocket)

@@ -12,9 +12,16 @@ export default function MetricsPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    api.getMetrics().then(setMetrics).catch(() => {}).finally(() => setLoading(false));
-    const id = setInterval(() => api.getMetrics().then(setMetrics).catch(() => {}), 10000);
-    return () => clearInterval(id);
+    const load = () => {
+      api.getMetrics().then(setMetrics).catch(() => {}).finally(() => setLoading(false));
+    };
+    load();
+    const cleanup = api.listenEvents((event) => {
+      if (event.type.startsWith('incident.') || event.type.startsWith('remediation.')) {
+        load();
+      }
+    });
+    return cleanup;
   }, []);
 
   if (loading) return <div className="page"><div className="empty-state"><span className="loading-spinner" /></div></div>;

@@ -38,4 +38,20 @@ export const api = {
 
   // Chaos
   injectChaos: (data) => fetchAPI('/api/v1/chaos/inject', { method: 'POST', body: JSON.stringify(data) }),
+
+  // WebSocket
+  listenEvents: (onEvent) => {
+    const wsUrl = API_BASE.replace(/^http/, 'ws') + '/api/v1/events/ws';
+    const ws = new WebSocket(wsUrl);
+    ws.onmessage = (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        onEvent(event);
+      } catch (err) {
+        console.error('Failed to parse WS event:', err);
+      }
+    };
+    ws.onerror = (e) => console.error('WS Error:', e);
+    return () => ws.close();
+  },
 };

@@ -82,6 +82,7 @@ class Incident(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
     resolved_at = Column(DateTime, nullable=True)
+    status_timeline = Column(JSON, default=list)
 
     # Relationships
     remediation_audits = relationship("RemediationAudit", back_populates="incident")
@@ -98,6 +99,11 @@ class Incident(Base):
         self.status = new_status
         if new_status == IncidentStatus.RESOLVED:
             self.resolved_at = datetime.datetime.utcnow()
+        
+        # Append to timeline
+        timeline = self.status_timeline if self.status_timeline else []
+        timeline.append({"status": new_status.value, "timestamp": datetime.datetime.utcnow().isoformat()})
+        self.status_timeline = timeline
 
 
 class RemediationAudit(Base):

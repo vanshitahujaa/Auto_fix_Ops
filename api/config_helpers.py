@@ -140,6 +140,14 @@ def set_system_mode(mode: str, reason: str = None):
 
         _system_cache.pop("global", None)
         logger.info(f"[SYSTEM] Mode changed to {mode}" + (f" — reason: {reason}" if reason else ""))
+        
+        # Emit WebSocket event
+        try:
+            from .events import emit_sync
+            emit_sync("system.mode_changed", {"mode": mode, "reason": reason})
+        except Exception as ws_e:
+            logger.error(f"[WS] Failed to emit system.mode_changed: {ws_e}")
+            
     except Exception as e:
         logger.error(f"[SYSTEM] Failed to set system mode: {e}")
         db.rollback()

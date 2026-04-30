@@ -28,7 +28,15 @@ export default function IncidentsPage() {
       .catch(() => setLoading(false));
   };
 
-  useEffect(() => { load(); const id = setInterval(load, 5000); return () => clearInterval(id); }, [filter]);
+  useEffect(() => {
+    load();
+    const cleanup = api.listenEvents((event) => {
+      if (event.type.startsWith('incident.') || event.type.startsWith('remediation.')) {
+        load();
+      }
+    });
+    return cleanup;
+  }, [filter]);
 
   return (
     <div className="page">

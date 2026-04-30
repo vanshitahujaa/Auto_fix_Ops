@@ -64,10 +64,19 @@ export default function IncidentDetailPage() {
   const [toast, setToast] = useState(null);
 
   useEffect(() => {
-    api.getIncidentContext(id)
-      .then(setData)
-      .catch(() => {})
-      .finally(() => setLoading(false));
+    const load = () => {
+      api.getIncidentContext(id)
+        .then(setData)
+        .catch(() => {})
+        .finally(() => setLoading(false));
+    };
+    load();
+    const cleanup = api.listenEvents((event) => {
+      if (event.incident_id === id) {
+        load();
+      }
+    });
+    return cleanup;
   }, [id]);
 
   const handleApprove = async () => {

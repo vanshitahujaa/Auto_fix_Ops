@@ -23,6 +23,7 @@ from .celery_app import celery_app
 from api.database import SessionLocal, incident_contexts_collection, logger
 from api.models import Incident, IncidentStatus
 from api.config_helpers import get_project_config, get_system_mode, is_system_disabled
+from api.events import emit_sync
 
 # Engine imports
 from engine.summarizer import ContextSummarizer
@@ -78,7 +79,7 @@ def fetch_prometheus_metric(query: str, prometheus_url: str = None):
 # TASK 1: Context Gathering
 # ════════════════════════════════════════════════════════════
 
-@celery_app.task(bind=True, max_retries=3)
+@celery_app.task(bind=True, max_retries=3, time_limit=120, soft_time_limit=90)
 def build_incident_context(self, incident_id: str):
     """Gathers telemetry from Prometheus, stores in MongoDB, transitions to CONTEXT_BUILT."""
     if _check_kill_switch(incident_id):
@@ -122,6 +123,7 @@ def build_incident_context(self, incident_id: str):
 
         # State transition
         incident.transition_to(IncidentStatus.CONTEXT_BUILT)
+        emit_sync("incident.status_changed", {"new_status": "CONTEXT_BUILT"}, str(incident.id))
         db.commit()
 
         logger.info(f"[TRACE:{incident_id}] === [TASK 1: CONTEXT] DONE → CONTEXT_BUILT ===")
@@ -207,8 +209,10 @@ def diagnose_incident(self, incident_id: str):
         incident.diagnosis_confidence = verdict.get("confidence", 1.0)
         incident.diagnosis_reasoning = verdict.get("reasoning", "")
         incident.diagnosed_by = diagnosed_by
+        emit_sync("incident.diagnosed", {"classification": incident.diagnosis_classification, "confidence": incident.diagnosis_confidence, "engine": incident.diagnosed_by}, str(incident.id))
 
         incident.transition_to(IncidentStatus.DIAGNOSED)
+        emit_sync("incident.status_changed", {"new_status": "DIAGNOSED"}, str(incident.id))
         db.commit()
 
         logger.info(
@@ -267,6 +271,7 @@ def evaluate_policy(self, incident_id: str, verdict: dict):
 
         if policy_result.decision == "APPROVED":
             incident.transition_to(IncidentStatus.POLICY_APPROVED)
+            emit_sync("incident.status_changed", {"new_status": "POLICY_APPROVED"}, str(incident.id))
             db.commit()
 
             # Chain to remediation
@@ -274,6 +279,7 @@ def evaluate_policy(self, incident_id: str, verdict: dict):
 
         elif policy_result.decision in ("ESCALATED", "REJECTED"):
             incident.transition_to(IncidentStatus.ESCALATED)
+            emit_sync("incident.status_changed", {"new_status": "ESCALATED"}, str(incident.id))
             db.commit()
             logger.info(
                 f"[TRACE:{incident_id}] === [TASK 3: POLICY] DONE → ESCALATED ==="
@@ -328,6 +334,7 @@ def execute_remediation(self, incident_id: str, verdict: dict):
                 f"Escalating instead."
             )
             incident.transition_to(IncidentStatus.ESCALATED)
+            emit_sync("incident.status_changed", {"new_status": "ESCALATED"}, str(incident.id))
             db.commit()
             return True
 
@@ -355,6 +362,7 @@ def execute_remediation(self, incident_id: str, verdict: dict):
         # Store resolved target on incident
         incident.resolved_target = resolved_target
         incident.transition_to(IncidentStatus.REMEDIATING)
+        emit_sync("incident.status_changed", {"new_status": "REMEDIATING"}, str(incident.id))
         db.commit()
 
         # Build summary text for the PR body
@@ -368,6 +376,7 @@ def execute_remediation(self, incident_id: str, verdict: dict):
         result = remediation_engine.execute(incident_id, verdict, summary_text)
 
         incident.transition_to(IncidentStatus.PENDING_PR_MERGE)
+        emit_sync("incident.status_changed", {"new_status": "PENDING_PR_MERGE"}, str(incident.id))
         db.commit()
 
         logger.info(
