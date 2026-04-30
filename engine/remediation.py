@@ -159,14 +159,30 @@ class RemediationEngine:
         # Get current manifest content
         try:
             file_content = repo.get_contents(self.manifest_path, ref=default_branch)
-            current_yaml = yaml.safe_load(file_content.decoded_content.decode("utf-8"))
+            raw_yaml = file_content.decoded_content.decode("utf-8")
+            documents = list(yaml.safe_load_all(raw_yaml))
         except GithubException as e:
             logger.error(f"[TRACE:{incident_id}] Failed to fetch manifest: {e}")
             raise
 
-        # Generate the bounded patch (returns tuple now)
-        patched_yaml, previous_values = self.patch_generator.generate(action, current_yaml)
-        patched_content = yaml.dump(patched_yaml, default_flow_style=False)
+        # Generate the bounded patch
+        patched_yaml = False
+        previous_values = {}
+        for i, doc in enumerate(documents):
+            if doc and doc.get("kind") in ("Deployment", "StatefulSet", "DaemonSet"):
+                try:
+                    patched_doc, prev_vals = self.patch_generator.generate(action, doc)
+                    documents[i] = patched_doc
+                    patched_yaml = True
+                    previous_values = prev_vals
+                    break
+                except Exception as e:
+                    logger.warning(f"[TRACE:{incident_id}] Could not patch document {i}: {e}")
+        
+        if not patched_yaml:
+            raise ValueError("No matching resource found to patch in the manifest.")
+
+        patched_content = yaml.dump_all(documents, default_flow_style=False)
 
         # Create branch from default
         source_branch = repo.get_branch(default_branch)
@@ -235,13 +251,27 @@ class RemediationEngine:
 
         try:
             file_content = repo.get_contents(self.manifest_path, ref=default_branch)
-            current_yaml = yaml.safe_load(file_content.decoded_content.decode("utf-8"))
+            raw_yaml = file_content.decoded_content.decode("utf-8")
+            documents = list(yaml.safe_load_all(raw_yaml))
         except GithubException as e:
             logger.error(f"[TRACE:{incident_id}] Failed to fetch manifest for rollback: {e}")
             raise
 
-        reverted_yaml = self.patch_generator.apply_rollback(current_yaml, previous_values)
-        reverted_content = yaml.dump(reverted_yaml, default_flow_style=False)
+        reverted_yaml = False
+        for i, doc in enumerate(documents):
+            if doc and doc.get("kind") in ("Deployment", "StatefulSet", "DaemonSet"):
+                try:
+                    reverted_doc = self.patch_generator.apply_rollback(doc, previous_values)
+                    documents[i] = reverted_doc
+                    reverted_yaml = True
+                    break
+                except Exception as e:
+                    logger.warning(f"[TRACE:{incident_id}] Could not rollback document {i}: {e}")
+        
+        if not reverted_yaml:
+            logger.warning(f"[TRACE:{incident_id}] No matching resource found to rollback.")
+
+        reverted_content = yaml.dump_all(documents, default_flow_style=False)
 
         source_branch = repo.get_branch(default_branch)
         try:

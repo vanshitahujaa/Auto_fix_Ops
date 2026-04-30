@@ -35,7 +35,27 @@ MIGRATIONS = [
     ("remediation_audits", "is_shadow_run",       "VARCHAR DEFAULT 'false'"),
     ("remediation_audits", "human_agreed",        'VARCHAR'),
     ("remediation_audits", "failure_reason",      'VARCHAR'),
-    ("remediation_audits", "failure_root_cause",  'VARCHAR'),  # we use string column to skip enum migration
+    ("remediation_audits", "failure_root_cause",  'VARCHAR'),
+
+    # project_config (added in Phase 7+ but not migrated yet)
+    ("project_config", "name",                          "VARCHAR DEFAULT 'Default Project'"),
+    ("project_config", "github_repo",                   "VARCHAR"),
+    ("project_config", "github_token_encrypted",        "TEXT"),
+    ("project_config", "prometheus_url",                "VARCHAR"),
+    ("project_config", "target_namespace",              "VARCHAR DEFAULT 'autofixops'"),
+    ("project_config", "target_manifest_path",          "VARCHAR DEFAULT 'kubernetes_integration/target_app/deployment.yaml'"),
+    ("project_config", "shadow_mode",                   "VARCHAR DEFAULT 'true'"),
+    ("project_config", "confidence_threshold",          "FLOAT DEFAULT 0.80"),
+    ("project_config", "allowed_chaos_namespaces",      "JSON"),
+    ("project_config", "max_resource_scale_factor",     "FLOAT DEFAULT 2.0"),
+    ("project_config", "created_at",                    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+    ("project_config", "updated_at",                    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+
+    # system_config (kill switch)
+    ("system_config", "system_mode",      "VARCHAR DEFAULT 'ACTIVE'"),
+    ("system_config", "disabled_reason",  "TEXT"),
+    ("system_config", "disabled_at",      "TIMESTAMP"),
+    ("system_config", "updated_at",       "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
 ]
 
 
