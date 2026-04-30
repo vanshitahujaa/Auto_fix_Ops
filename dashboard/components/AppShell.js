@@ -11,7 +11,46 @@ const NAV = [
   { href: '/onboard', icon: '⚙️', label: 'Settings' },
 ];
 
-function TopBar() {
+function KillSwitchBanner({ systemMode, onModeChange }) {
+  const [reason, setReason] = useState('');
+
+  if (systemMode === 'ACTIVE') return null;
+
+  const isDisabled = systemMode === 'DISABLED';
+
+  return (
+    <div style={{
+      background: isDisabled ? 'rgba(220,38,38,0.15)' : 'rgba(245,158,11,0.12)',
+      border: `1px solid ${isDisabled ? 'rgba(220,38,38,0.5)' : 'rgba(245,158,11,0.4)'}`,
+      borderRadius: 'var(--radius)',
+      padding: '12px 18px',
+      display: 'flex',
+      alignItems: 'center',
+      gap: 12,
+      fontSize: 13,
+      color: isDisabled ? 'var(--error)' : 'var(--warning)',
+    }}>
+      <span style={{ fontSize: 20 }}>{isDisabled ? '🛑' : '🛡'}</span>
+      <div style={{ flex: 1 }}>
+        <strong>{isDisabled ? 'SYSTEM DISABLED' : 'SHADOW MODE'}</strong>
+        {isDisabled
+          ? ' — All execution halted. No tasks, PRs, or chaos injections.'
+          : ' — PRs are drafts. No auto-merge.'}
+      </div>
+      {isDisabled && (
+        <button
+          className="btn btn-outline"
+          style={{ fontSize: 11, padding: '4px 12px', borderColor: 'var(--success)', color: 'var(--success)' }}
+          onClick={() => onModeChange('ACTIVE')}
+        >
+          Re-enable
+        </button>
+      )}
+    </div>
+  );
+}
+
+function TopBar({ onModeChange }) {
   const [status, setStatus] = useState(null);
 
   useEffect(() => {
@@ -23,35 +62,59 @@ function TopBar() {
 
   if (!status) {
     return (
-      <div className="top-bar">
-        <span className="loading-spinner" />
-      </div>
+      <>
+        <div className="top-bar">
+          <span className="loading-spinner" />
+        </div>
+      </>
     );
   }
 
-  const shadowClass = status.shadow_mode === 'true' ? 'shadow' : 'live';
-  const cbClass = status.circuit_breaker.toLowerCase().replace('_', '-');
+  const mode = status.system_mode || 'ACTIVE';
+  const cbState = status.circuit_breaker || 'CLOSED';
+  const cbClass = cbState.toLowerCase().replace('_', '-');
   const ghClass = status.github_connected ? 'connected' : 'disconnected';
 
+  const modeColors = { ACTIVE: 'green', SHADOW: 'yellow', DISABLED: 'red' };
+  const modeLabels = { ACTIVE: '🟢 ACTIVE', SHADOW: '🛡 SHADOW', DISABLED: '🛑 DISABLED' };
+
   return (
-    <div className="top-bar">
-      <div className="status-pill" style={{ marginRight: 'auto' }}>
-        <span className={`dot ${status.shadow_mode === 'true' ? 'yellow' : 'green'}`} />
-        {status.target_namespace}
+    <>
+      <KillSwitchBanner systemMode={mode} onModeChange={onModeChange} />
+      <div className="top-bar">
+        <div className="status-pill" style={{ marginRight: 'auto' }}>
+          <span className={`dot ${modeColors[mode] || 'yellow'}`} />
+          {status.target_namespace}
+        </div>
+
+        <select
+          value={mode}
+          onChange={(e) => onModeChange(e.target.value)}
+          style={{
+            background: 'var(--bg-secondary)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius)',
+            color: mode === 'DISABLED' ? 'var(--error)' : mode === 'SHADOW' ? 'var(--warning)' : 'var(--success)',
+            fontSize: 11,
+            padding: '4px 8px',
+            fontWeight: 600,
+            cursor: 'pointer',
+          }}
+        >
+          <option value="ACTIVE">🟢 ACTIVE</option>
+          <option value="SHADOW">🛡 SHADOW</option>
+          <option value="DISABLED">🛑 DISABLED</option>
+        </select>
+
+        <span className={`status-pill ${cbClass}`}>
+          CB: {cbState}
+        </span>
+
+        <span className={`status-pill ${ghClass}`}>
+          {status.github_connected ? '✓ GitHub' : '✗ GitHub'}
+        </span>
       </div>
-
-      <span className={`status-pill ${shadowClass}`}>
-        {status.shadow_mode === 'true' ? '🛡 SHADOW' : '🟢 LIVE'}
-      </span>
-
-      <span className={`status-pill ${cbClass}`}>
-        CB: {status.circuit_breaker}
-      </span>
-
-      <span className={`status-pill ${ghClass}`}>
-        {status.github_connected ? '✓ GitHub' : '✗ GitHub'}
-      </span>
-    </div>
+    </>
   );
 }
 
@@ -87,7 +150,16 @@ export default function AppShell({ children }) {
     setMounted(true);
   }, []);
 
-  // Prevent hydration mismatch by only rendering client-dependent UI after mount
+  const handleModeChange = async (newMode) => {
+    try {
+      await api.setSystemMode(newMode, newMode === 'DISABLED' ? 'Manual kill switch from dashboard' : '');
+      // Force re-render by reloading status
+      window.location.reload();
+    } catch (e) {
+      alert(`Failed to change mode: ${e.message}`);
+    }
+  };
+
   if (!mounted) {
     return (
       <div className="app-layout">
@@ -119,7 +191,7 @@ export default function AppShell({ children }) {
     <div className="app-layout">
       <Sidebar />
       <main className="main-content">
-        <TopBar />
+        <TopBar onModeChange={handleModeChange} />
         {children}
       </main>
     </div>

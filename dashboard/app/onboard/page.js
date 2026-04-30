@@ -7,6 +7,7 @@ const STEPS = ['GitHub', 'Infrastructure', 'Safety', 'Validate'];
 export default function OnboardPage() {
   const [step, setStep] = useState(0);
   const [config, setConfig] = useState({
+    name: 'Default Project',
     github_token: '',
     github_repo: '',
     prometheus_url: '',
@@ -14,11 +15,14 @@ export default function OnboardPage() {
     target_manifest_path: 'kubernetes_integration/target_app/deployment.yaml',
     shadow_mode: 'true',
     confidence_threshold: 0.8,
+    allowed_chaos_namespaces: ['staging', 'test', 'dev', 'default', 'autofixops'],
+    max_resource_scale_factor: 2.0,
   });
   const [existing, setExisting] = useState(null);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState(null);
   const [validation, setValidation] = useState({});
+  const [systemMode, setSystemMode] = useState('ACTIVE');
 
   useEffect(() => {
     api.getConfig().then((data) => {
@@ -26,15 +30,20 @@ export default function OnboardPage() {
         setExisting(data);
         setConfig((c) => ({
           ...c,
+          name: data.name || 'Default Project',
           github_repo: data.github_repo || '',
           prometheus_url: data.prometheus_url || '',
           target_namespace: data.target_namespace || 'autofixops',
           target_manifest_path: data.target_manifest_path || '',
           shadow_mode: data.shadow_mode || 'true',
           confidence_threshold: data.confidence_threshold || 0.8,
+          allowed_chaos_namespaces: data.allowed_chaos_namespaces || ['staging', 'test', 'dev', 'default', 'autofixops'],
+          max_resource_scale_factor: data.max_resource_scale_factor || 2.0,
         }));
       }
     }).catch(() => {});
+
+    api.getSystemMode().then((data) => setSystemMode(data.system_mode)).catch(() => {});
   }, []);
 
   const update = (key, val) => setConfig((c) => ({ ...c, [key]: val }));
@@ -55,7 +64,6 @@ export default function OnboardPage() {
     setValidation({ testing: true });
     const results = {};
 
-    // Test GitHub
     if (config.github_repo) {
       try {
         const res = await fetch(`https://api.github.com/repos/${config.github_repo}`, {
@@ -67,7 +75,6 @@ export default function OnboardPage() {
       results.github = 'skip';
     }
 
-    // Test Prometheus
     if (config.prometheus_url) {
       try {
         const res = await fetch(`${config.prometheus_url}/-/healthy`, { signal: AbortSignal.timeout(5000) });
@@ -77,7 +84,6 @@ export default function OnboardPage() {
       results.prometheus = 'skip';
     }
 
-    // Backend API
     try {
       await api.getStatus();
       results.backend = 'pass';
@@ -85,6 +91,8 @@ export default function OnboardPage() {
 
     setValidation(results);
   };
+
+  const chaosNsStr = (config.allowed_chaos_namespaces || []).join(', ');
 
   return (
     <div className="page">
@@ -112,6 +120,15 @@ export default function OnboardPage() {
         {step === 0 && (
           <>
             <h3 style={{ marginBottom: 20, fontSize: 16 }}>GitHub Connection</h3>
+            <div className="form-group">
+              <label>Project Name</label>
+              <input
+                type="text"
+                value={config.name}
+                onChange={(e) => update('name', e.target.value)}
+                placeholder="My Production App"
+              />
+            </div>
             <div className="form-group">
               <label>Repository (owner/repo)</label>
               <input
@@ -206,6 +223,33 @@ export default function OnboardPage() {
                 Minimum confidence required for policy approval. Below this → escalate to human.
               </span>
             </div>
+            <div className="form-group">
+              <label>Max Resource Scale Factor ({config.max_resource_scale_factor}x)</label>
+              <input
+                type="range"
+                min="1.5"
+                max="5.0"
+                step="0.5"
+                value={config.max_resource_scale_factor}
+                onChange={(e) => update('max_resource_scale_factor', parseFloat(e.target.value))}
+                style={{ background: 'transparent' }}
+              />
+              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                Maximum multiplier for resource patches (e.g. 2x = 128Mi → max 256Mi). Hard cap: 4Gi / 4 CPU.
+              </span>
+            </div>
+            <div className="form-group">
+              <label>Allowed Chaos Namespaces</label>
+              <input
+                type="text"
+                value={chaosNsStr}
+                onChange={(e) => update('allowed_chaos_namespaces', e.target.value.split(',').map(s => s.trim()).filter(Boolean))}
+                placeholder="staging, test, dev, default"
+              />
+              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                Comma-separated list. Chaos injection is BLOCKED for any namespace not listed here.
+              </span>
+            </div>
             <div style={{ display: 'flex', gap: 8 }}>
               <button className="btn btn-outline" onClick={() => setStep(1)}>← Back</button>
               <button className="btn btn-primary" onClick={handleSave} disabled={saving}>
@@ -243,6 +287,45 @@ export default function OnboardPage() {
                 ))}
               </div>
             )}
+
+            {/* System Mode Control */}
+            <div style={{ marginTop: 24, paddingTop: 24, borderTop: '1px solid var(--border)' }}>
+              <h3 style={{ marginBottom: 12, fontSize: 14, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                System Mode Control
+              </h3>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                {['ACTIVE', 'SHADOW', 'DISABLED'].map((mode) => (
+                  <button
+                    key={mode}
+                    className={`btn ${
+                      mode === 'DISABLED' ? 'btn-danger'
+                        : mode === 'SHADOW' ? 'btn-outline'
+                          : 'btn-success'
+                    }`}
+                    style={{
+                      opacity: systemMode === mode ? 1 : 0.4,
+                      fontSize: 12,
+                      padding: '8px 16px',
+                      border: systemMode === mode ? '2px solid' : undefined,
+                    }}
+                    onClick={async () => {
+                      try {
+                        await api.setSystemMode(mode, mode === 'DISABLED' ? 'Manual from settings page' : '');
+                        setSystemMode(mode);
+                        setToast({ type: 'success', msg: `System mode → ${mode}` });
+                      } catch (e) {
+                        setToast({ type: 'error', msg: e.message });
+                      }
+                    }}
+                  >
+                    {mode === 'ACTIVE' ? '🟢' : mode === 'SHADOW' ? '🛡' : '🛑'} {mode}
+                  </button>
+                ))}
+              </div>
+              <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'block', marginTop: 8 }}>
+                DISABLED = all execution halted. SHADOW = PRs are drafts. ACTIVE = full autonomous operation.
+              </span>
+            </div>
           </>
         )}
       </div>
