@@ -1,11 +1,11 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: autofixops-target-app
-  namespace: autofixops
   labels:
     app: target-app
     system: autofixops
+  name: autofixops-target-app
+  namespace: autofixops
 spec:
   replicas: 1
   selector:
@@ -16,35 +16,34 @@ spec:
     metadata:
       labels:
         app: target-app
+        prometheus.io/port: '8000'
+        prometheus.io/scrape: 'true'
         system: autofixops
-        # Required to tell Prometheus to scrape this pod if using ServiceMonitors or standard pod annotations
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "8000"
     spec:
       containers:
-      - name: target-app
-        image: autofixops/target-app:latest
-        imagePullPolicy: Never # Good for local minikube building
-        ports:
-        - containerPort: 8000
-        resources:
-          requests:
-            memory: "64Mi"
-            cpu: "100m"
-          limits:
-            memory: "100Mi" # Very tight memory limit to ensure /leak triggers OOMKilled fast
-            cpu: "500m"
+      - image: autofixops/target-app:latest
+        imagePullPolicy: Never
         livenessProbe:
+          failureThreshold: 3
           httpGet:
             path: /health
             port: 8000
           initialDelaySeconds: 5
           periodSeconds: 5
           timeoutSeconds: 2
-          failureThreshold: 3
+        name: target-app
+        ports:
+        - containerPort: 8000
         readinessProbe:
           httpGet:
             path: /health
             port: 8000
           initialDelaySeconds: 5
           periodSeconds: 5
+        resources:
+          limits:
+            cpu: 500m
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 64Mi
