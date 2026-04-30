@@ -25,8 +25,9 @@ class AIDiagnosisEngine:
     Phase 3 LLM Engine. Strictly bounded reasoning restricted to Pydantic outputs.
     """
     def __init__(self):
-        # We assume OPENAI_API_KEY is available in the environment
-        self.llm = ChatOpenAI(temperature=0.0, model="gpt-4o-mini")
+        # We assume OPENAI_API_KEY and OPENAI_API_BASE are available in the environment
+        model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
+        self.llm = ChatOpenAI(temperature=0.0, model=model_name)
         self.parser = PydanticOutputParser(pydantic_object=AIFinalVerdict)
 
         self.prompt = PromptTemplate(

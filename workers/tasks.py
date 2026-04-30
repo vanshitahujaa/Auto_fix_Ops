@@ -17,6 +17,7 @@ Pipeline:
   verify_resolution       →  RESOLVED / FAILED
 """
 
+import os
 import requests
 import time
 from .celery_app import celery_app
@@ -47,31 +48,39 @@ def _check_kill_switch(incident_id: str) -> bool:
     return False
 
 
+_DEFAULT_PROM_URL = os.getenv("PROMETHEUS_URL", "").strip()
+
+
 def _get_prometheus_url(project_id: str = None) -> str:
-    """Gets Prometheus URL from project config or env."""
+    """Gets Prometheus URL from project config, falling back to env, then to in-cluster DNS."""
     if project_id:
         config = get_project_config(project_id)
         if config and config.get("prometheus_url"):
             return config["prometheus_url"]
+    if _DEFAULT_PROM_URL:
+        return _DEFAULT_PROM_URL
     return "http://prometheus-operated.autofixops.svc.cluster.local:9090"
 
 
 def fetch_prometheus_metric(query: str, prometheus_url: str = None):
-    """Executes a promQL query with strict timeouts."""
-    url = prometheus_url or "http://prometheus-operated.autofixops.svc.cluster.local:9090"
+    """Executes a promQL query with strict timeouts. Returns [] on any failure."""
+    url = prometheus_url or _get_prometheus_url()
     try:
         response = requests.get(
             f"{url}/api/v1/query",
             params={"query": query},
-            timeout=10,
+            timeout=3,
         )
         response.raise_for_status()
         return response.json().get("data", {}).get("result", [])
     except requests.Timeout:
-        logger.error(f"Prometheus query timed out (10s)")
+        logger.warning(f"Prometheus query timed out (3s) — degrading to empty context.")
+        return []
+    except requests.exceptions.ConnectionError:
+        logger.warning(f"Prometheus unreachable at {url} — degrading to empty context.")
         return []
     except Exception as e:
-        logger.error(f"Prometheus query failed: {e}")
+        logger.warning(f"Prometheus query failed ({e.__class__.__name__}) — degrading to empty context.")
         return []
 
 
@@ -117,9 +126,15 @@ def build_incident_context(self, incident_id: str):
             "target_pod": pod_name,
         }
 
-        incident_contexts_collection.update_one(
-            {"incident_id": incident_id}, {"$set": context_doc}, upsert=True
-        )
+        try:
+            incident_contexts_collection.update_one(
+                {"incident_id": incident_id}, {"$set": context_doc}, upsert=True
+            )
+        except Exception as mongo_err:
+            logger.warning(
+                f"[TRACE:{incident_id}] MongoDB write failed ({mongo_err.__class__.__name__}); "
+                f"continuing without persistent context."
+            )
 
         # State transition
         incident.transition_to(IncidentStatus.CONTEXT_BUILT)
@@ -165,12 +180,22 @@ def diagnose_incident(self, incident_id: str):
             logger.warning(f"[TRACE:{incident_id}] Not in CONTEXT_BUILT state. Skipping.")
             return True
 
-        # Fetch context from Mongo
-        context_doc = incident_contexts_collection.find_one({"incident_id": incident_id})
+        # Fetch context from Mongo (degrade gracefully if Atlas is down)
+        try:
+            context_doc = incident_contexts_collection.find_one({"incident_id": incident_id})
+        except Exception as mongo_err:
+            logger.warning(
+                f"[TRACE:{incident_id}] MongoDB read failed ({mongo_err.__class__.__name__}); "
+                f"using empty context."
+            )
+            context_doc = None
+
         if not context_doc:
-            logger.error(f"[TRACE:{incident_id}] No context document found in MongoDB.")
-            _mark_failed(db, incident_id)
-            return False
+            logger.warning(
+                f"[TRACE:{incident_id}] No context document available — "
+                f"diagnosing on alert metadata only."
+            )
+            context_doc = {"incident_id": incident_id, "metrics": {"cpu": [], "memory": []}}
 
         alert_name = incident.alert_name
 
@@ -340,7 +365,14 @@ def execute_remediation(self, incident_id: str, verdict: dict):
 
         # ─── Target resolution ───
         resolver = TargetResolver()
-        context_doc = incident_contexts_collection.find_one({"incident_id": incident_id})
+        try:
+            context_doc = incident_contexts_collection.find_one({"incident_id": incident_id})
+        except Exception as mongo_err:
+            logger.warning(
+                f"[TRACE:{incident_id}] MongoDB read failed in remediation "
+                f"({mongo_err.__class__.__name__}); resolving without context."
+            )
+            context_doc = None
 
         try:
             resolved_target = resolver.resolve(
