@@ -13,12 +13,13 @@ import asyncio
 from .database import init_relational_db, get_db, incident_contexts_collection, logger
 from .models import (
     Incident, IncidentStatus, RemediationAudit, ExecutionStatus,
-    ProjectConfig, SystemConfig, SystemMode
+    ProjectConfig, SystemConfig, SystemMode, ServiceAccount
 )
 from .schemas import AlertmanagerPayload
 from .config_helpers import (
     get_project_config, invalidate_config_cache, get_default_project_id,
-    get_system_mode, set_system_mode, is_system_disabled
+    get_system_mode, set_system_mode, is_system_disabled,
+    invalidate_service_account_cache
 )
 from workers.tasks import build_incident_context, execute_remediation
 from .events import ws_manager, redis_listener, emit_sync
@@ -565,7 +566,106 @@ async def rollback_patch(incident_id: str, db: Session = Depends(get_db)):
 
 
 # ════════════════════════════════════════════════════════════
-# ENDPOINT 11: WebSocket Events
+# ENDPOINT 11: Service Account Management
+# ════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/service-account")
+async def get_service_account(db: Session = Depends(get_db)):
+    """Returns the current service account configuration (token is masked)."""
+    sa = db.query(ServiceAccount).filter(ServiceAccount.id == "github").first()
+    if not sa:
+        return {"configured": False}
+    return {
+        "configured": True,
+        "display_name": sa.display_name,
+        "github_username": sa.github_username,
+        "github_token": sa.get_masked_token(),
+        "is_active": sa.is_active,
+        "created_at": sa.created_at.isoformat() if sa.created_at else None,
+        "updated_at": sa.updated_at.isoformat() if sa.updated_at else None,
+    }
+
+
+@app.post("/api/v1/service-account")
+async def save_service_account(request: Request, db: Session = Depends(get_db)):
+    """
+    Creates or updates the system-level GitHub service account.
+    Validates the token against GitHub API and auto-discovers the username.
+    """
+    body = await request.json()
+    token = body.get("github_token", "").strip()
+    display_name = body.get("display_name", "AutoFixOps Bot")
+
+    if not token:
+        raise HTTPException(status_code=400, detail="github_token is required.")
+
+    # Validate the token against GitHub API
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://api.github.com/user",
+                headers={"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"},
+            )
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=400,
+                detail=f"GitHub token validation failed (HTTP {resp.status_code}). "
+                       f"Ensure the token has 'repo' scope.",
+            )
+        github_user = resp.json()
+        github_username = github_user.get("login", "")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="GitHub API timed out during token validation.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to validate token: {e}")
+
+    # Upsert the service account
+    sa = db.query(ServiceAccount).filter(ServiceAccount.id == "github").first()
+    if not sa:
+        sa = ServiceAccount(id="github")
+        db.add(sa)
+
+    sa.display_name = display_name
+    sa.github_username = github_username
+    sa.set_github_token(token)
+    sa.is_active = "true"
+    db.commit()
+    db.refresh(sa)
+
+    # Invalidate cache
+    invalidate_service_account_cache()
+
+    logger.info(f"[SERVICE ACCOUNT] Configured: {github_username} ({display_name})")
+    return {
+        "status": "saved",
+        "github_username": github_username,
+        "display_name": display_name,
+        "message": f"Service account configured as @{github_username}",
+    }
+
+
+@app.delete("/api/v1/service-account")
+async def delete_service_account(db: Session = Depends(get_db)):
+    """Removes the service account. System falls back to .env token."""
+    sa = db.query(ServiceAccount).filter(ServiceAccount.id == "github").first()
+    if not sa:
+        raise HTTPException(status_code=404, detail="No service account configured.")
+
+    db.delete(sa)
+    db.commit()
+
+    # Invalidate cache
+    invalidate_service_account_cache()
+
+    logger.info("[SERVICE ACCOUNT] Deleted. Falling back to .env token.")
+    return {"status": "deleted", "message": "Service account removed. System will use .env fallback."}
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT 12: WebSocket Events
 # ════════════════════════════════════════════════════════════
 
 @app.websocket("/api/v1/events/ws")

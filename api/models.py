@@ -219,3 +219,55 @@ class SystemConfig(Base):
     disabled_reason = Column(Text, nullable=True)
     disabled_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
+class ServiceAccount(Base):
+    """
+    System-level GitHub service account (bot identity).
+    Singleton row (id='github'). All engine components resolve
+    credentials through this before falling back to .env.
+    """
+    __tablename__ = "service_accounts"
+
+    id = Column(String, primary_key=True, default="github")
+    account_type = Column(String, nullable=False, default="github")
+    display_name = Column(String, nullable=False, default="AutoFixOps Bot")
+    github_username = Column(String, nullable=True)
+    github_token_encrypted = Column(Text, nullable=True)
+    is_active = Column(String, default="true")  # "true" / "false"
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow,
+                        onupdate=datetime.datetime.utcnow)
+
+    @staticmethod
+    def _get_fernet():
+        """Returns a Fernet cipher using the ENCRYPTION_KEY env var."""
+        import os
+        from cryptography.fernet import Fernet
+        import base64
+        import hashlib
+        key_material = os.getenv("ENCRYPTION_KEY", "autofixops-default-key-change-me")
+        key = base64.urlsafe_b64encode(hashlib.sha256(key_material.encode()).digest())
+        return Fernet(key)
+
+    def set_github_token(self, plaintext_token: str):
+        """Encrypts and stores the GitHub token."""
+        if not plaintext_token:
+            self.github_token_encrypted = None
+            return
+        f = self._get_fernet()
+        self.github_token_encrypted = f.encrypt(plaintext_token.encode()).decode()
+
+    def get_github_token(self) -> str:
+        """Decrypts and returns the GitHub token."""
+        if not self.github_token_encrypted:
+            return ""
+        f = self._get_fernet()
+        return f.decrypt(self.github_token_encrypted.encode()).decode()
+
+    def get_masked_token(self) -> str:
+        """Returns masked token for UI display."""
+        token = self.get_github_token()
+        if not token or len(token) < 8:
+            return "***"
+        return token[:4] + "****" + token[-4:]

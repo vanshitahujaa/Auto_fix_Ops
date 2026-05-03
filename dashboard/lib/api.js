@@ -39,6 +39,11 @@ export const api = {
   // Chaos
   injectChaos: (data) => fetchAPI('/api/v1/chaos/inject', { method: 'POST', body: JSON.stringify(data) }),
 
+  // Service Account
+  getServiceAccount: () => fetchAPI('/api/v1/service-account'),
+  saveServiceAccount: (data) => fetchAPI('/api/v1/service-account', { method: 'POST', body: JSON.stringify(data) }),
+  deleteServiceAccount: () => fetchAPI('/api/v1/service-account', { method: 'DELETE' }),
+
   // WebSocket
   listenEvents: (onEvent) => {
     const wsUrl = API_BASE.replace(/^http/, 'ws') + '/api/v1/events/ws';

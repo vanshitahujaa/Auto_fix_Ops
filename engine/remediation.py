@@ -33,9 +33,13 @@ class RemediationEngine:
     def __init__(self, project_config: Dict[str, Any] = None):
         self.config = project_config or {}
 
-        # Use project config first, fall back to env vars
-        github_token = self.config.get("github_token") or os.getenv("GITHUB_TOKEN", "")
-        self.github_repo = self.config.get("github_repo") or os.getenv("GITHUB_REPO", "")
+        # Resolve GitHub credentials through centralized helper
+        from api.config_helpers import get_github_credentials
+        project_id = self.config.get("id")
+        gh_creds = get_github_credentials(project_id)
+
+        github_token = gh_creds.get("token", "")
+        self.github_repo = self.config.get("github_repo") or gh_creds.get("repo", "") or os.getenv("GITHUB_REPO", "")
         self.manifest_path = (
             self.config.get("target_manifest_path")
             or os.getenv("TARGET_MANIFEST_PATH", "kubernetes_integration/target_app/deployment.yaml")
@@ -49,8 +53,11 @@ class RemediationEngine:
 
         if not github_token:
             logger.warning("[REMEDIATION] No GitHub token. PR creation will be simulated.")
+        else:
+            logger.info(f"[REMEDIATION] GitHub credentials source: {gh_creds.get('source', 'unknown')}")
         self.github = Github(github_token) if github_token else None
         self.patch_generator = PatchGenerator(max_scale_factor=self.max_scale_factor)
+
 
     def execute(
         self,
