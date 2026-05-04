@@ -51,13 +51,23 @@ class VerificationEngine:
 
     def __init__(self, project_config: Dict[str, Any] = None):
         self.config = project_config or {}
-        github_token = self.config.get("github_token") or os.getenv("GITHUB_TOKEN", "")
-        self.github_repo = self.config.get("github_repo") or os.getenv("GITHUB_REPO", "")
+
+        # Resolve GitHub credentials through centralized helper
+        from api.config_helpers import get_github_credentials
+        project_id = self.config.get("id")
+        gh_creds = get_github_credentials(project_id)
+
+        github_token = gh_creds.get("token", "")
+        self.github_repo = self.config.get("github_repo") or gh_creds.get("repo", "") or os.getenv("GITHUB_REPO", "")
         self.prometheus_url = (
             self.config.get("prometheus_url")
             or os.getenv("PROMETHEUS_URL", "http://prometheus-operated.autofixops.svc.cluster.local:9090")
         )
         self.github = Github(github_token) if github_token else None
+
+        if github_token:
+            logger.info(f"[VERIFICATION] GitHub credentials source: {gh_creds.get('source', 'unknown')}")
+
 
     def verify(
         self,

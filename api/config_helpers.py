@@ -9,14 +9,87 @@ import time
 import logging
 from typing import Optional
 from .database import SessionLocal
-from .models import ProjectConfig, SystemConfig, SystemMode
+from .models import ProjectConfig, SystemConfig, SystemMode, ServiceAccount
 
 logger = logging.getLogger("autofixops")
 
 # ─── TTL Cache ───
 _config_cache: dict = {}  # {project_id: (config_dict, timestamp)}
 _system_cache: dict = {}  # {"global": (system_config_dict, timestamp)}
+_service_account_cache: dict = {}  # {"github": (creds_dict, timestamp)}
 CONFIG_TTL_SECONDS = 30
+
+
+def get_github_credentials(project_id: str = None) -> dict:
+    """
+    Resolves GitHub credentials using priority chain:
+      1. ProjectConfig override (if project has its own token)
+      2. ServiceAccount (system-wide bot)
+      3. .env fallback (GITHUB_TOKEN + GITHUB_REPO)
+
+    Returns: {"token": str, "repo": str, "source": str, "username": str}
+    """
+    import os
+
+    # Priority 1: Project-level override
+    if project_id:
+        project_config = get_project_config(project_id)
+        if project_config and project_config.get("github_token"):
+            logger.debug(f"[GITHUB] Using project-level token for {project_id}")
+            return {
+                "token": project_config["github_token"],
+                "repo": project_config.get("github_repo", ""),
+                "source": "project_config",
+                "username": "",
+            }
+
+    # Priority 2: Service account (cached)
+    now = time.time()
+    cached = _service_account_cache.get("github")
+    if cached and (now - cached[1]) < CONFIG_TTL_SECONDS:
+        if cached[0].get("token"):
+            return cached[0]
+
+    db = SessionLocal()
+    try:
+        sa = db.query(ServiceAccount).filter(
+            ServiceAccount.id == "github",
+            ServiceAccount.is_active == "true",
+        ).first()
+
+        if sa and sa.github_token_encrypted:
+            creds = {
+                "token": sa.get_github_token(),
+                "repo": os.getenv("GITHUB_REPO", ""),
+                "source": "service_account",
+                "username": sa.github_username or "",
+            }
+            _service_account_cache["github"] = (creds, now)
+            logger.debug(f"[GITHUB] Using service account: {sa.display_name}")
+            return creds
+    except Exception as e:
+        logger.error(f"[GITHUB] Failed to fetch service account: {e}")
+    finally:
+        db.close()
+
+    # Priority 3: .env fallback
+    env_token = os.getenv("GITHUB_TOKEN", "")
+    env_repo = os.getenv("GITHUB_REPO", "")
+    creds = {
+        "token": env_token,
+        "repo": env_repo,
+        "source": "env",
+        "username": "",
+    }
+    _service_account_cache["github"] = (creds, now)
+    if env_token:
+        logger.debug("[GITHUB] Using .env fallback token")
+    return creds
+
+
+def invalidate_service_account_cache():
+    """Call after service account POST/DELETE to force re-fetch."""
+    _service_account_cache.pop("github", None)
 
 
 def get_project_config(project_id: str) -> Optional[dict]:

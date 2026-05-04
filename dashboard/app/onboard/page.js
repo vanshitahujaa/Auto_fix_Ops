@@ -2,7 +2,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../../lib/api';
 
-const STEPS = ['GitHub', 'Infrastructure', 'Safety', 'Validate'];
+const STEPS = ['Bot Account', 'GitHub', 'Infrastructure', 'Safety', 'Validate'];
 
 export default function OnboardPage() {
   const [step, setStep] = useState(0);
@@ -24,6 +24,12 @@ export default function OnboardPage() {
   const [validation, setValidation] = useState({});
   const [systemMode, setSystemMode] = useState('ACTIVE');
 
+  // Service account state
+  const [serviceAccount, setServiceAccount] = useState(null);
+  const [botToken, setBotToken] = useState('');
+  const [botDisplayName, setBotDisplayName] = useState('AutoFixOps Bot');
+  const [savingBot, setSavingBot] = useState(false);
+
   useEffect(() => {
     api.getConfig().then((data) => {
       if (data.configured) {
@@ -44,16 +50,56 @@ export default function OnboardPage() {
     }).catch(() => {});
 
     api.getSystemMode().then((data) => setSystemMode(data.system_mode)).catch(() => {});
+
+    // Fetch service account status
+    api.getServiceAccount().then((data) => {
+      if (data.configured) setServiceAccount(data);
+    }).catch(() => {});
   }, []);
 
   const update = (key, val) => setConfig((c) => ({ ...c, [key]: val }));
+
+  const handleSaveBot = async () => {
+    if (!botToken.trim()) {
+      setToast({ type: 'error', msg: 'Bot token is required' });
+      return;
+    }
+    setSavingBot(true);
+    try {
+      const result = await api.saveServiceAccount({
+        github_token: botToken,
+        display_name: botDisplayName,
+      });
+      setServiceAccount({
+        configured: true,
+        github_username: result.github_username,
+        display_name: result.display_name,
+        is_active: 'true',
+      });
+      setBotToken('');
+      setToast({ type: 'success', msg: result.message });
+    } catch (e) {
+      setToast({ type: 'error', msg: e.message });
+    }
+    setSavingBot(false);
+  };
+
+  const handleDeleteBot = async () => {
+    try {
+      await api.deleteServiceAccount();
+      setServiceAccount(null);
+      setToast({ type: 'success', msg: 'Service account removed. Using .env fallback.' });
+    } catch (e) {
+      setToast({ type: 'error', msg: e.message });
+    }
+  };
 
   const handleSave = async () => {
     setSaving(true);
     try {
       await api.saveConfig(config);
       setToast({ type: 'success', msg: 'Configuration saved securely' });
-      setStep(3);
+      setStep(4);
     } catch (e) {
       setToast({ type: 'error', msg: e.message });
     }
@@ -89,6 +135,12 @@ export default function OnboardPage() {
       results.backend = 'pass';
     } catch { results.backend = 'fail'; }
 
+    // Check service account
+    try {
+      const sa = await api.getServiceAccount();
+      results.serviceAccount = sa.configured ? 'pass' : 'skip';
+    } catch { results.serviceAccount = 'fail'; }
+
     setValidation(results);
   };
 
@@ -116,8 +168,74 @@ export default function OnboardPage() {
       </div>
 
       <div className="card">
-        {/* Step 0: GitHub */}
+        {/* Step 0: Bot Account */}
         {step === 0 && (
+          <>
+            <h3 style={{ marginBottom: 20, fontSize: 16 }}>🤖 System Service Account</h3>
+            <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 16, lineHeight: 1.6 }}>
+              Configure a dedicated GitHub account for AutoFixOps. All PRs, branches, and commits will
+              be created under this bot identity — keeping the system&apos;s actions separate from personal accounts.
+            </p>
+
+            {serviceAccount ? (
+              <div style={{ padding: 16, background: 'var(--bg-secondary)', borderRadius: 8, marginBottom: 16 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+                  <span style={{ fontSize: 24 }}>✅</span>
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: 14 }}>{serviceAccount.display_name}</div>
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                      @{serviceAccount.github_username} · {serviceAccount.is_active === 'true' ? 'Active' : 'Inactive'}
+                    </div>
+                  </div>
+                </div>
+                {serviceAccount.github_token && (
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
+                    Token: {serviceAccount.github_token}
+                  </div>
+                )}
+                <button className="btn btn-danger" onClick={handleDeleteBot} style={{ fontSize: 12 }}>
+                  🗑 Remove Service Account
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className="form-group">
+                  <label>Bot Display Name</label>
+                  <input
+                    type="text"
+                    value={botDisplayName}
+                    onChange={(e) => setBotDisplayName(e.target.value)}
+                    placeholder="AutoFixOps Bot"
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Bot Personal Access Token</label>
+                  <input
+                    type="password"
+                    value={botToken}
+                    onChange={(e) => setBotToken(e.target.value)}
+                    placeholder="github_pat_xxxxxxxxxxxx"
+                  />
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    🔒 Token is validated against GitHub API, then encrypted with AES-256. Username is auto-discovered.
+                  </span>
+                </div>
+                <button className="btn btn-primary" onClick={handleSaveBot} disabled={savingBot}>
+                  {savingBot ? <span className="loading-spinner" /> : '🔗 Connect Bot Account'}
+                </button>
+              </>
+            )}
+
+            <div style={{ marginTop: 16 }}>
+              <button className="btn btn-primary" onClick={() => setStep(1)}>
+                Next → GitHub Project
+              </button>
+            </div>
+          </>
+        )}
+
+        {/* Step 1: GitHub Project */}
+        {step === 1 && (
           <>
             <h3 style={{ marginBottom: 20, fontSize: 16 }}>GitHub Connection</h3>
             <div className="form-group">
@@ -139,25 +257,32 @@ export default function OnboardPage() {
               />
             </div>
             <div className="form-group">
-              <label>Personal Access Token</label>
+              <label>Personal Access Token (Optional Override)</label>
               <input
                 type="password"
                 value={config.github_token}
                 onChange={(e) => update('github_token', e.target.value)}
-                placeholder={existing ? `Current: ${existing.github_token}` : 'ghp_xxxxxxxxxxxx'}
+                placeholder={existing ? `Current: ${existing.github_token}` : 'Leave blank to use bot account'}
               />
               <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                🔒 Encrypted at rest with AES-256. Never stored in plaintext.
+                {serviceAccount
+                  ? `💡 Bot account @${serviceAccount.github_username} will be used unless you override here.`
+                  : '🔒 Encrypted at rest with AES-256. Never stored in plaintext.'
+                }
               </span>
             </div>
-            <button className="btn btn-primary" onClick={() => setStep(1)}>
-              Next → Infrastructure
-            </button>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn btn-outline" onClick={() => setStep(0)}>← Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(2)}>
+                Next → Infrastructure
+              </button>
+            </div>
           </>
         )}
 
-        {/* Step 1: Infrastructure */}
-        {step === 1 && (
+
+        {/* Step 2: Infrastructure */}
+        {step === 2 && (
           <>
             <h3 style={{ marginBottom: 20, fontSize: 16 }}>Infrastructure</h3>
             <div className="form-group">
@@ -188,14 +313,14 @@ export default function OnboardPage() {
               />
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
-              <button className="btn btn-outline" onClick={() => setStep(0)}>← Back</button>
-              <button className="btn btn-primary" onClick={() => setStep(2)}>Next → Safety</button>
+              <button className="btn btn-outline" onClick={() => setStep(1)}>← Back</button>
+              <button className="btn btn-primary" onClick={() => setStep(3)}>Next → Safety</button>
             </div>
           </>
         )}
 
-        {/* Step 2: Safety */}
-        {step === 2 && (
+        {/* Step 3: Safety */}
+        {step === 3 && (
           <>
             <h3 style={{ marginBottom: 20, fontSize: 16 }}>Safety Settings</h3>
             <div className="form-group">
@@ -251,7 +376,7 @@ export default function OnboardPage() {
               </span>
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
-              <button className="btn btn-outline" onClick={() => setStep(1)}>← Back</button>
+              <button className="btn btn-outline" onClick={() => setStep(2)}>← Back</button>
               <button className="btn btn-primary" onClick={handleSave} disabled={saving}>
                 {saving ? <span className="loading-spinner" /> : '💾 Save Configuration'}
               </button>
@@ -259,8 +384,8 @@ export default function OnboardPage() {
           </>
         )}
 
-        {/* Step 3: Validate */}
-        {step === 3 && (
+        {/* Step 4: Validate */}
+        {step === 4 && (
           <>
             <h3 style={{ marginBottom: 20, fontSize: 16 }}>Connection Validation</h3>
             {!validation.testing && !validation.backend && (
@@ -275,6 +400,7 @@ export default function OnboardPage() {
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 16 }}>
                 {[
                   { label: 'Backend API', status: validation.backend },
+                  { label: 'Service Account', status: validation.serviceAccount },
                   { label: 'GitHub API', status: validation.github },
                   { label: 'Prometheus', status: validation.prometheus },
                 ].map((t) => (
