@@ -74,6 +74,7 @@ export default function IncidentsPage() {
               <tr>
                 <th>ID</th>
                 <th>Alert</th>
+                <th>Severity</th>
                 <th>Status</th>
                 <th>Diagnosis</th>
                 <th>Confidence</th>
@@ -86,6 +87,11 @@ export default function IncidentsPage() {
                 <tr key={inc.id} onClick={() => router.push(`/incidents/${inc.id}`)}>
                   <td className="mono text-muted">{inc.id.slice(0, 8)}</td>
                   <td>{inc.alert_name}</td>
+                  <td>
+                    <span className={`badge ${inc.severity?.toLowerCase() || 'info'}`}>
+                      {inc.severity || 'unknown'}
+                    </span>
+                  </td>
                   <td>
                     <span className={`badge ${inc.status.toLowerCase()}`}>
                       {inc.status.replace(/_/g, ' ')}

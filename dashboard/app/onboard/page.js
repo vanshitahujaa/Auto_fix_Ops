@@ -121,25 +121,15 @@ export default function OnboardPage() {
       results.github = 'skip';
     }
 
-    if (config.prometheus_url) {
-      try {
-        const res = await fetch(`${config.prometheus_url}/-/healthy`, { signal: AbortSignal.timeout(5000) });
-        results.prometheus = res.ok ? 'pass' : 'fail';
-      } catch { results.prometheus = 'fail'; }
-    } else {
-      results.prometheus = 'skip';
-    }
+    try {
+      await api.checkPrometheusHealth();
+      results.prometheus = 'pass';
+    } catch { results.prometheus = 'fail'; }
 
     try {
       await api.getStatus();
       results.backend = 'pass';
     } catch { results.backend = 'fail'; }
-
-    // Check service account
-    try {
-      const sa = await api.getServiceAccount();
-      results.serviceAccount = sa.configured ? 'pass' : 'skip';
-    } catch { results.serviceAccount = 'fail'; }
 
     setValidation(results);
   };
@@ -255,21 +245,6 @@ export default function OnboardPage() {
                 onChange={(e) => update('github_repo', e.target.value)}
                 placeholder="vanshitahujaa/Auto_fix_Ops"
               />
-            </div>
-            <div className="form-group">
-              <label>Personal Access Token (Optional Override)</label>
-              <input
-                type="password"
-                value={config.github_token}
-                onChange={(e) => update('github_token', e.target.value)}
-                placeholder={existing ? `Current: ${existing.github_token}` : 'Leave blank to use bot account'}
-              />
-              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                {serviceAccount
-                  ? `💡 Bot account @${serviceAccount.github_username} will be used unless you override here.`
-                  : '🔒 Encrypted at rest with AES-256. Never stored in plaintext.'
-                }
-              </span>
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
               <button className="btn btn-outline" onClick={() => setStep(0)}>← Back</button>
@@ -399,8 +374,7 @@ export default function OnboardPage() {
             {validation.backend && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 16 }}>
                 {[
-                  { label: 'Backend API', status: validation.backend },
-                  { label: 'Service Account', status: validation.serviceAccount },
+                  { label: 'AutoFixOps Backend API', status: validation.backend },
                   { label: 'GitHub API', status: validation.github },
                   { label: 'Prometheus', status: validation.prometheus },
                 ].map((t) => (
@@ -438,6 +412,7 @@ export default function OnboardPage() {
                       try {
                         await api.setSystemMode(mode, mode === 'DISABLED' ? 'Manual from settings page' : '');
                         setSystemMode(mode);
+                        window.dispatchEvent(new Event('local_mode_changed'));
                         setToast({ type: 'success', msg: `System mode → ${mode}` });
                       } catch (e) {
                         setToast({ type: 'error', msg: e.message });

@@ -31,17 +31,7 @@ def get_github_credentials(project_id: str = None) -> dict:
     """
     import os
 
-    # Priority 1: Project-level override
-    if project_id:
-        project_config = get_project_config(project_id)
-        if project_config and project_config.get("github_token"):
-            logger.debug(f"[GITHUB] Using project-level token for {project_id}")
-            return {
-                "token": project_config["github_token"],
-                "repo": project_config.get("github_repo", ""),
-                "source": "project_config",
-                "username": "",
-            }
+    # Priority 1: Project-level override has been deprecated in favor of the system-wide Bot Account.
 
     # Priority 2: Service account (cached)
     now = time.time()
@@ -112,7 +102,6 @@ def get_project_config(project_id: str) -> Optional[dict]:
             "id": str(config.id),
             "name": config.name,
             "github_repo": config.github_repo,
-            "github_token": config.get_github_token(),
             "prometheus_url": config.prometheus_url,
             "target_namespace": config.target_namespace,
             "target_manifest_path": config.target_manifest_path,

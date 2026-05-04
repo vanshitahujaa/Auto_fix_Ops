@@ -61,7 +61,14 @@ function TopBar({ onModeChange }) {
         load();
       }
     });
-    return cleanup;
+
+    const localUpdate = () => load();
+    window.addEventListener('local_mode_changed', localUpdate);
+
+    return () => {
+      cleanup();
+      window.removeEventListener('local_mode_changed', localUpdate);
+    };
   }, []);
 
   if (!status) {

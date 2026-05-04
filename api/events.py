@@ -97,7 +97,12 @@ _sync_redis_client = None
 def get_sync_redis():
     global _sync_redis_client
     if _sync_redis_client is None:
-        _sync_redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        _sync_redis_client = redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_timeout=0.5,
+            socket_connect_timeout=0.5
+        )
     return _sync_redis_client
 
 def build_event(event_type: str, data: Dict[str, Any], incident_id: str = None) -> Dict[str, Any]:

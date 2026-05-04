@@ -1,0 +1,20 @@
+# Alertmanager configuration for AutoFixOps
+# Receives alerts from Prometheus and forwards them as
+# Alertmanager-format webhooks to the AutoFixOps API Gateway.
+
+global:
+  resolve_timeout: 1m
+
+route:
+  receiver: autofixops-webhook
+  group_by: ['alertname', 'namespace', 'pod']
+  group_wait: 10s        # Wait 10s after first alert before sending group
+  group_interval: 30s    # Wait 30s before sending updates for same group
+  repeat_interval: 10m   # Don't re-send same alert for 10 minutes (prevents duplicate incidents)
+
+receivers:
+  - name: autofixops-webhook
+    webhook_configs:
+      - url: 'http://host.docker.internal:8000/api/v1/alerts'
+        send_resolved: true
+        max_alerts: 10

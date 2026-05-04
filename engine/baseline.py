@@ -10,11 +10,20 @@ class RuleBasedDiagnosisEngine:
     """
     
     def __init__(self):
-        # Bounded taxonomy definition maps directly to Phase 1 alerts
+        # Bounded taxonomy definition maps directly to Phase 1 alerts.
+        # Includes both Kubernetes-native names and Prometheus alert rule names.
         self.rules = {
+            # CPU alerts
             "HighCPUUsage": self._handle_cpu_spike,
+            # Memory alerts
             "TargetAppMemoryLeak": self._handle_memory_leak,
-            "PodCrashLooping": self._handle_crash_loop
+            "HighMemoryUsage": self._handle_memory_leak,
+            # Crash/restart alerts
+            "PodCrashLooping": self._handle_crash_loop,
+            "TargetAppCrashLoop": self._handle_crash_loop,
+            "CrashLoopBackOff": self._handle_crash_loop,
+            # Target down
+            "TargetAppDown": self._handle_crash_loop,
         }
 
     def analyze(self, incident_name: str, context: Dict[str, Any]) -> Dict[str, Any]:
