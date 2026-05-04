@@ -1,0 +1,83 @@
+# AutoFixOps Alert Rules
+# These fire webhooks to the AutoFixOps API via Alertmanager
+# when the Render-hosted test app shows anomalies.
+
+groups:
+  - name: autofixops_target_app
+    rules:
+
+      # ── Memory Leak Detection ────────────────────────────────
+      # Fires when the app's RSS memory increases by >50MB
+      # within a 2-minute window (indicates active leak).
+      - alert: TargetAppMemoryLeak
+        expr: >
+          (process_resident_memory_bytes{job="shortener-api"}
+           - process_resident_memory_bytes{job="shortener-api"} offset 2m)
+          > 50000000
+        for: 15s
+        labels:
+          severity: critical
+          namespace: shortener
+          pod: shortener-api
+          container: api
+        annotations:
+          summary: "Memory leak detected on shortener-api"
+          description: >
+            Container api in pod shortener-api in namespace shortener
+            has increased memory by more than 50MB in the last 2 minutes.
+            This indicates a potential memory leak.
+          runbook_url: "https://shortener-api-qurk.onrender.com"
+
+      # ── High Absolute Memory ─────────────────────────────────
+      # Fires when RSS exceeds 150MB (baseline is ~85MB).
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes{job="shortener-api"} > 150000000
+        for: 15s
+        labels:
+          severity: warning
+          namespace: shortener
+          pod: shortener-api
+          container: api
+        annotations:
+          summary: "High memory usage on shortener-api"
+          description: >
+            Container api in pod shortener-api is using more than 150MB
+            of memory, exceeding the threshold.
+
+      # ── CrashLoop Detection (via process restart) ────────────
+      # Detects when the process has restarted at least once
+      # in the last 5 minutes by tracking changes in
+      # process_start_time_seconds. Render restarts too fast
+      # for the `up==0` approach to catch.
+      - alert: TargetAppCrashLoop
+        expr: changes(process_start_time_seconds{job="shortener-api"}[5m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+          namespace: shortener
+          pod: shortener-api
+          container: api
+        annotations:
+          summary: "Target app is crash-looping (process restarted)"
+          description: >
+            The shortener-api process has restarted
+            {{ $value }} time(s) in the last 5 minutes.
+            This indicates a crash loop or forced restart.
+          runbook_url: "https://shortener-api-qurk.onrender.com"
+
+      # ── Target Completely Down ───────────────────────────────
+      # Fires if the scrape target is totally unreachable for 30s.
+      - alert: TargetAppDown
+        expr: up{job="shortener-api"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          namespace: shortener
+          pod: shortener-api
+          container: api
+        annotations:
+          summary: "Target app is completely unreachable"
+          description: >
+            The shortener-api target has been unreachable for >30 seconds.
+            Prometheus scrape failures indicate the application is down.
+          runbook_url: "https://shortener-api-qurk.onrender.com"

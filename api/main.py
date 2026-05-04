@@ -141,7 +141,7 @@ async def receive_alert(
 # ════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/incidents")
-async def list_incidents(
+def list_incidents(
     status: Optional[str] = Query(None, description="Filter by status"),
     limit: int = Query(50, le=200),
     db: Session = Depends(get_db),
@@ -181,7 +181,7 @@ async def list_incidents(
 # ════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/incidents/{incident_id}/context")
-async def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
+def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found.")
@@ -234,7 +234,7 @@ async def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
 # ════════════════════════════════════════════════════════════
 
 @app.post("/api/v1/escalations/{incident_id}/approve")
-async def approve_escalation(incident_id: str, db: Session = Depends(get_db)):
+def approve_escalation(incident_id: str, db: Session = Depends(get_db)):
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found.")
@@ -326,7 +326,7 @@ def _compute_metrics(db: Session, since: Optional[datetime] = None) -> dict:
 
 
 @app.get("/api/v1/metrics")
-async def get_metrics(db: Session = Depends(get_db)):
+def get_metrics(db: Session = Depends(get_db)):
     now = datetime.utcnow()
     return {
         "all_time": _compute_metrics(db),
@@ -340,23 +340,55 @@ async def get_metrics(db: Session = Depends(get_db)):
 # ════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/status")
-async def get_system_status(db: Session = Depends(get_db)):
+def get_system_status(db: Session = Depends(get_db)):
     from engine.circuit_breaker import get_circuit_breaker_registry
+    from api.config_helpers import get_github_credentials
 
     # Get default project config
     config = db.query(ProjectConfig).first()
     registry = get_circuit_breaker_registry()
     system_mode = get_system_mode()
+    
+    github_creds = get_github_credentials(str(config.id) if config else None)
 
     return {
         "system_mode": system_mode,
         "shadow_mode": config.shadow_mode if config else "true",
         "circuit_breaker": registry.global_breaker.state,
         "circuit_breaker_states": registry.get_all_states(),
-        "github_connected": bool(config and config.github_token_encrypted),
+        "github_connected": bool(github_creds.get("token")),
         "prometheus_url": config.prometheus_url if config else None,
         "target_namespace": config.target_namespace if config else "autofixops",
     }
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT 6b: Prometheus Health Check (proxy for dashboard)
+# ════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/prometheus/health")
+async def check_prometheus_health(db: Session = Depends(get_db)):
+    """Proxies a health check to Prometheus (browser can't call directly due to CORS)."""
+    config = db.query(ProjectConfig).first()
+    prom_url = (
+        (config.prometheus_url if config else None)
+        or os.getenv("PROMETHEUS_URL", "")
+    )
+    if not prom_url:
+        raise HTTPException(status_code=404, detail="No Prometheus URL configured.")
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{prom_url}/-/healthy")
+        if resp.status_code == 200:
+            return {"status": "healthy", "prometheus_url": prom_url}
+        raise HTTPException(status_code=502, detail=f"Prometheus returned HTTP {resp.status_code}")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Prometheus health check timed out.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to reach Prometheus: {e}")
 
 
 # ════════════════════════════════════════════════════════════
@@ -386,7 +418,7 @@ async def get_system_mode_endpoint():
 # ════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/config")
-async def get_config(db: Session = Depends(get_db)):
+def get_config(db: Session = Depends(get_db)):
     config = db.query(ProjectConfig).first()
     if not config:
         return {"configured": False}
@@ -395,7 +427,6 @@ async def get_config(db: Session = Depends(get_db)):
         "project_id": str(config.id),
         "name": config.name,
         "github_repo": config.github_repo,
-        "github_token": config.get_masked_token(),
         "prometheus_url": config.prometheus_url,
         "target_namespace": config.target_namespace,
         "target_manifest_path": config.target_manifest_path,
@@ -429,9 +460,7 @@ async def save_config(request: Request, db: Session = Depends(get_db)):
     if "max_resource_scale_factor" in body:
         config.max_resource_scale_factor = min(body["max_resource_scale_factor"], 5.0)
 
-    # Token: only update if provided (never return raw)
-    if body.get("github_token"):
-        config.set_github_token(body["github_token"])
+    # Token setting has been removed since we only use the system-wide bot account.
 
     db.commit()
     db.refresh(config)
@@ -526,7 +555,7 @@ async def inject_chaos(request: Request, db: Session = Depends(get_db)):
 # ════════════════════════════════════════════════════════════
 
 @app.post("/api/v1/incidents/{incident_id}/rollback")
-async def rollback_patch(incident_id: str, db: Session = Depends(get_db)):
+def rollback_patch(incident_id: str, db: Session = Depends(get_db)):
     """Initiates a rollback using the stored previous_values from the remediation audit."""
     audit = (
         db.query(RemediationAudit)
@@ -570,7 +599,7 @@ async def rollback_patch(incident_id: str, db: Session = Depends(get_db)):
 # ════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/service-account")
-async def get_service_account(db: Session = Depends(get_db)):
+def get_service_account(db: Session = Depends(get_db)):
     """Returns the current service account configuration (token is masked)."""
     sa = db.query(ServiceAccount).filter(ServiceAccount.id == "github").first()
     if not sa:
@@ -648,7 +677,7 @@ async def save_service_account(request: Request, db: Session = Depends(get_db)):
 
 
 @app.delete("/api/v1/service-account")
-async def delete_service_account(db: Session = Depends(get_db)):
+def delete_service_account(db: Session = Depends(get_db)):
     """Removes the service account. System falls back to .env token."""
     sa = db.query(ServiceAccount).filter(ServiceAccount.id == "github").first()
     if not sa:

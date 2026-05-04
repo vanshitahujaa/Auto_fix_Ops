@@ -75,6 +75,10 @@ export default function MetricsPage() {
           <div className="value warning">{m.escalated || 0}</div>
         </div>
         <div className="metric-card">
+          <div className="label">Verification Success</div>
+          <div className="value info">{m.verification_success_rate != null ? `${Math.round(m.verification_success_rate * 100)}%` : '0%'}</div>
+        </div>
+        <div className="metric-card">
           <div className="label">Shadow Runs</div>
           <div className="value" style={{ color: 'var(--accent)' }}>{m.shadow_runs || 0}</div>
         </div>

@@ -22,7 +22,7 @@ PG_URL = os.getenv("POSTGRES_URL", "")
 if not PG_URL:
     logger.warning("[DB INIT] POSTGRES_URL not set. Database operations will fail.")
 
-engine = create_engine(PG_URL, echo=False, pool_pre_ping=True, pool_recycle=300)
+engine = create_engine(PG_URL, echo=False, pool_pre_ping=False, pool_recycle=300)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -65,7 +65,7 @@ class _InMemoryCollection:
         existing.update(new_fields)
         self._docs[key] = existing
 
-    def find_one(self, filter_):
+    def find_one(self, filter_, *args, **kwargs):
         key = filter_.get("incident_id")
         return self._docs.get(key)
 

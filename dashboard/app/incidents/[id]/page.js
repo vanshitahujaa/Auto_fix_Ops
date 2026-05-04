@@ -95,7 +95,7 @@ export default function IncidentDetailPage() {
     setRollingBack(true);
     try {
       const result = await api.rollbackIncident(id);
-      setToast({ type: 'success', msg: `Rollback queued: ${JSON.stringify(result.previous_values)}` });
+      setToast({ type: 'success', msg: result.message || `Rollback queued: ${result.pr_url}` });
     } catch (e) {
       setToast({ type: 'error', msg: e.message });
     }
@@ -169,52 +169,56 @@ export default function IncidentDetailPage() {
         {/* Remediation Audit */}
         <div className="card">
           <h3 style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-            Remediation
+            Remediation Audits
           </h3>
-          {audit ? (
-            <>
-              <div style={{ marginBottom: 8 }}>
-                <span className="text-muted text-sm">Action: </span>
-                <span className="mono">{audit.action}</span>
-              </div>
-              <div style={{ marginBottom: 8 }}>
-                <span className="text-muted text-sm">Verdict: </span>
-                <span className={`badge ${audit.policy_verdict?.toLowerCase()}`}>
-                  {audit.policy_verdict}
-                </span>
-              </div>
-              <div style={{ marginBottom: 8 }}>
-                <span className="text-muted text-sm">Execution: </span>
-                <span className="mono">{audit.execution_status || 'Pending'}</span>
-              </div>
-              {audit.failure_reason && (
-                <div style={{ marginBottom: 8 }}>
-                  <span className="text-muted text-sm">Failure: </span>
-                  <span style={{ color: 'var(--error)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
-                    {audit.failure_reason}
-                  </span>
+          {remediation_audits && remediation_audits.length > 0 ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              {remediation_audits.map((a, idx) => (
+                <div key={a.id || idx} style={{ paddingBottom: idx < remediation_audits.length - 1 ? 16 : 0, borderBottom: idx < remediation_audits.length - 1 ? '1px solid var(--border)' : 'none' }}>
+                  <div style={{ marginBottom: 8 }}>
+                    <span className="text-muted text-sm">Action: </span>
+                    <span className="mono">{a.action}</span>
+                  </div>
+                  <div style={{ marginBottom: 8 }}>
+                    <span className="text-muted text-sm">Verdict: </span>
+                    <span className={`badge ${a.policy_verdict?.toLowerCase()}`}>
+                      {a.policy_verdict}
+                    </span>
+                  </div>
+                  <div style={{ marginBottom: 8 }}>
+                    <span className="text-muted text-sm">Execution: </span>
+                    <span className="mono">{a.execution_status || 'Pending'}</span>
+                  </div>
+                  {a.failure_reason && (
+                    <div style={{ marginBottom: 8 }}>
+                      <span className="text-muted text-sm">Failure: </span>
+                      <span style={{ color: 'var(--error)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                        {a.failure_reason}
+                      </span>
+                    </div>
+                  )}
+                  {a.failure_root_cause && (
+                    <div style={{ marginBottom: 8 }}>
+                      <span className="text-muted text-sm">Root Cause: </span>
+                      <span className={`badge ${a.failure_root_cause === 'LOGIC' ? 'failed' : 'escalated'}`}>
+                        {a.failure_root_cause}
+                      </span>
+                    </div>
+                  )}
+                  {a.pr_url && (
+                    <div style={{ marginBottom: 8 }}>
+                      <span className="text-muted text-sm">PR: </span>
+                      <a href={a.pr_url} target="_blank" rel="noopener" style={{ color: 'var(--accent)' }}>
+                        {a.pr_url.split('/').slice(-2).join('/')}
+                      </a>
+                    </div>
+                  )}
+                  {a.is_shadow === 'true' && (
+                    <div className="status-pill shadow" style={{ marginTop: 8, display: 'inline-block' }}>🛡 Shadow Run</div>
+                  )}
                 </div>
-              )}
-              {audit.failure_root_cause && (
-                <div style={{ marginBottom: 8 }}>
-                  <span className="text-muted text-sm">Root Cause: </span>
-                  <span className={`badge ${audit.failure_root_cause === 'LOGIC' ? 'failed' : 'escalated'}`}>
-                    {audit.failure_root_cause}
-                  </span>
-                </div>
-              )}
-              {audit.pr_url && (
-                <div style={{ marginBottom: 8 }}>
-                  <span className="text-muted text-sm">PR: </span>
-                  <a href={audit.pr_url} target="_blank" rel="noopener" style={{ color: 'var(--accent)' }}>
-                    {audit.pr_url.split('/').slice(-2).join('/')}
-                  </a>
-                </div>
-              )}
-              {audit.is_shadow === 'true' && (
-                <div className="status-pill shadow" style={{ marginTop: 8, display: 'inline-block' }}>🛡 Shadow Run</div>
-              )}
-            </>
+              ))}
+            </div>
           ) : (
             <p className="text-muted">No remediation audit yet</p>
           )}
@@ -295,6 +299,41 @@ export default function IncidentDetailPage() {
             <div className="policy-gate">
               <span className="gate-icon">{audit.is_shadow === 'true' ? '🛡' : '🟢'}</span>
               Mode: {audit.is_shadow === 'true' ? 'Shadow' : 'Live'}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Telemetry Context */}
+      {telemetry_context && (
+        <div className="card mt-16">
+          <h3 style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+            📊 Telemetry Evidence
+          </h3>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+            <div style={{ background: 'var(--bg-secondary)', padding: 12, borderRadius: 8 }}>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>CPU Usage (last 1m)</div>
+              {telemetry_context.metrics?.cpu?.length > 0 ? (
+                telemetry_context.metrics.cpu.map((series, i) => (
+                  <div key={i} className="mono text-sm">
+                    {series.value?.[1] ? `${parseFloat(series.value[1]).toFixed(4)} cores` : 'No data'}
+                  </div>
+                ))
+              ) : (
+                <div className="text-muted text-sm">No CPU data</div>
+              )}
+            </div>
+            <div style={{ background: 'var(--bg-secondary)', padding: 12, borderRadius: 8 }}>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>Memory Usage (last 5m)</div>
+              {telemetry_context.metrics?.memory?.length > 0 ? (
+                telemetry_context.metrics.memory.map((series, i) => (
+                  <div key={i} className="mono text-sm">
+                    {series.value?.[1] ? `${(parseFloat(series.value[1]) / 1024 / 1024).toFixed(1)} MB` : 'No data'}
+                  </div>
+                ))
+              ) : (
+                <div className="text-muted text-sm">No memory data</div>
+              )}
             </div>
           </div>
         </div>

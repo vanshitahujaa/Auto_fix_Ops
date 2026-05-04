@@ -1,0 +1,39 @@
+# Prometheus configuration for AutoFixOps
+# Scrapes the Render-hosted shortener test app's /metrics endpoint
+
+global:
+  scrape_interval: 15s        # How often to scrape targets
+  evaluation_interval: 15s    # How often to evaluate rules
+  scrape_timeout: 10s         # Per-scrape timeout
+
+# Alertmanager configuration — routes fired alerts to Alertmanager container
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+# Alert rule files
+rule_files:
+  - "alert_rules.yml"
+
+scrape_configs:
+  # ─── Prometheus self-monitoring ─────────────────────────────
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # ─── Render-hosted shortener-api ────────────────────────────
+  # Scrapes https://shortener-api-qurk.onrender.com/metrics
+  # Note: Render free tier sleeps after 15min idle.
+  #       Prometheus scraping every 15s keeps it awake.
+  - job_name: 'shortener-api'
+    scheme: https
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['shortener-api-qurk.onrender.com']
+        labels:
+          environment: 'render'
+          app: 'shortener'
+          service: 'api'

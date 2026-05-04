@@ -39,6 +39,9 @@ export const api = {
   // Chaos
   injectChaos: (data) => fetchAPI('/api/v1/chaos/inject', { method: 'POST', body: JSON.stringify(data) }),
 
+  // Prometheus
+  checkPrometheusHealth: () => fetchAPI('/api/v1/prometheus/health'),
+
   // Service Account
   getServiceAccount: () => fetchAPI('/api/v1/service-account'),
   saveServiceAccount: (data) => fetchAPI('/api/v1/service-account', { method: 'POST', body: JSON.stringify(data) }),
