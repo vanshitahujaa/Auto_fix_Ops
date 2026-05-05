@@ -524,9 +524,9 @@ async def inject_chaos(request: Request, db: Session = Depends(get_db)):
 
     # Route to target app endpoint
     endpoint_map = {
-        "memory_leak": "/leak",
-        "cpu_spike": "/cpu",
-        "crash_loop": "/crash",
+        "memory_leak": "/_chaos/leak",
+        "cpu_spike": "/_chaos/cpu",
+        "crash_loop": "/_chaos/crash",
     }
     endpoint = endpoint_map.get(fault_type)
     if not endpoint:
@@ -537,17 +537,60 @@ async def inject_chaos(request: Request, db: Session = Depends(get_db)):
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{target_url}{endpoint}")
+            resp = await client.post(f"{target_url}{endpoint}")
         logger.info(f"[CHAOS] Injected {fault_type} via {target_url}{endpoint} → {resp.status_code}")
-        return {
-            "status": "injected",
-            "fault_type": fault_type,
-            "target": f"{target_url}{endpoint}",
-            "response_code": resp.status_code,
-            "cooldown_seconds": CHAOS_COOLDOWN_SECONDS,
-        }
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to reach target: {str(e)}")
+
+    # Create an incident so the remediation pipeline picks it up
+    fault_to_alert = {
+        "memory_leak": ("ChaosInjection:MemoryLeak", "HIGH"),
+        "cpu_spike":   ("ChaosInjection:CPUSpike",   "MEDIUM"),
+        "crash_loop":  ("ChaosInjection:CrashLoop",  "HIGH"),
+    }
+    alert_name, severity = fault_to_alert[fault_type]
+    dedup_key = hashlib.md5(
+        f"chaos-{fault_type}-{project_id}-{int(time.time() / 120)}".encode()
+    ).hexdigest()
+
+    incident = Incident(
+        alert_fingerprint=dedup_key,
+        alert_name=alert_name,
+        severity=severity,
+        status=IncidentStatus.INGESTED,
+        raw_payload_cache={
+            "chaos": True,
+            "fault_type": fault_type,
+            "target_url": target_url,
+            "labels": {
+                "alertname": alert_name,
+                "namespace": namespace,
+                "severity": severity.lower(),
+            },
+        },
+        project_id=config.id if config else None,
+    )
+    try:
+        db.add(incident)
+        db.commit()
+        db.refresh(incident)
+        logger.info(f"[CHAOS] Created Incident {incident.id} for {fault_type}")
+        try:
+            emit_sync("incident.created", {"alert_name": alert_name, "severity": severity}, str(incident.id))
+        except Exception as e:
+            logger.error(f"[WS] Failed to emit incident.created for chaos: {e}")
+        build_incident_context.apply_async(args=[str(incident.id)])
+    except IntegrityError:
+        db.rollback()
+        logger.warning(f"[CHAOS] Deduplicated incident for {fault_type}")
+
+    return {
+        "status": "injected",
+        "fault_type": fault_type,
+        "target": f"{target_url}{endpoint}",
+        "response_code": resp.status_code,
+        "cooldown_seconds": CHAOS_COOLDOWN_SECONDS,
+    }
 
 
 # ════════════════════════════════════════════════════════════
