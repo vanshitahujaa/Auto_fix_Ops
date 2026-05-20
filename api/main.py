@@ -535,10 +535,16 @@ async def inject_chaos(request: Request, db: Session = Depends(get_db)):
     if not target_url:
         raise HTTPException(status_code=400, detail="target_url is required.")
 
+    # Clean up target_url if it has trailing slash or /chaos
+    target_url = target_url.rstrip("/").replace("/_chaos", "").replace("/chaos", "")
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(f"{target_url}{endpoint}")
-        logger.info(f"[CHAOS] Injected {fault_type} via {target_url}{endpoint} → {resp.status_code}")
+            url = f"{target_url}{endpoint}"
+            if fault_type == "memory_leak":
+                url += "?mb=50"
+            resp = await client.post(url)
+        logger.info(f"[CHAOS] Injected {fault_type} via {url} → {resp.status_code}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to reach target: {str(e)}")
 
